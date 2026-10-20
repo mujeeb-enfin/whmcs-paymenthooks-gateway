@@ -1,4 +1,5 @@
 <?php
+
 /**
  * Resolves PaymentHooks connection settings from WHMCS gateway params.
  * Selects test vs live keys by Mode, and builds the API base URL from the
@@ -18,7 +19,7 @@ class Config
 
     /** @var string */
     public $mode;
-    /** @var string resolved API base, e.g. https://payments.mr-innovations.com/api/v1 */
+    /** @var string resolved API base, e.g. https://paymenthooks.com/api/v1 */
     public $baseUrl;
     /** @var string */
     public $secretKey;

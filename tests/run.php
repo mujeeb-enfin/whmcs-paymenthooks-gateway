@@ -1,4 +1,5 @@
 <?php
+
 /**
  * Standalone tests for the pure, WHMCS-independent logic:
  *   - Signature verification (HMAC, replay window, rotation)
@@ -40,8 +41,14 @@ function check(string $label, $got, $want): void
         echo "  FAIL  $label\n        got:  " . var_export($got, true) . "\n        want: " . var_export($want, true) . "\n";
     }
 }
-function check_true(string $label, bool $got): void { check($label, $got, true); }
-function check_false(string $label, bool $got): void { check($label, $got, false); }
+function check_true(string $label, bool $got): void
+{
+    check($label, $got, true);
+}
+function check_false(string $label, bool $got): void
+{
+    check($label, $got, false);
+}
 
 /* ---- Signature ------------------------------------------------------- */
 echo "Signature:\n";
@@ -49,18 +56,28 @@ $secret = 'whsec_test_123';
 $body = '{"id":"evt_1","type":"checkout.session.completed"}';
 $t = time();
 $good = hash_hmac('sha256', $t . '.' . $body, $secret);
-check_true('valid signature accepted',
-    Signature::verify($body, "t={$t},v1={$good}", $secret));
-check_false('tampered body rejected',
-    Signature::verify($body . 'x', "t={$t},v1={$good}", $secret));
-check_false('wrong secret rejected',
-    Signature::verify($body, "t={$t},v1={$good}", 'other'));
+check_true(
+    'valid signature accepted',
+    Signature::verify($body, "t={$t},v1={$good}", $secret)
+);
+check_false(
+    'tampered body rejected',
+    Signature::verify($body . 'x', "t={$t},v1={$good}", $secret)
+);
+check_false(
+    'wrong secret rejected',
+    Signature::verify($body, "t={$t},v1={$good}", 'other')
+);
 $old = $t - 10000;
 $oldSig = hash_hmac('sha256', $old . '.' . $body, $secret);
-check_false('stale timestamp rejected (replay window)',
-    Signature::verify($body, "t={$old},v1={$oldSig}", $secret));
-check_true('rotation: previous-secret signature accepted via v1_previous',
-    Signature::verify($body, "t={$t},v1=deadbeef,v1_previous={$good}", $secret));
+check_false(
+    'stale timestamp rejected (replay window)',
+    Signature::verify($body, "t={$old},v1={$oldSig}", $secret)
+);
+check_true(
+    'rotation: previous-secret signature accepted via v1_previous',
+    Signature::verify($body, "t={$t},v1=deadbeef,v1_previous={$good}", $secret)
+);
 check_false('empty secret rejected', Signature::verify($body, "t={$t},v1={$good}", ''));
 check_false('missing t rejected', Signature::verify($body, "v1={$good}", $secret));
 
