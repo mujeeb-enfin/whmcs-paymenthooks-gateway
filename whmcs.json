@@ -1,0 +1,31 @@
+{
+    "schema": "1.0",
+    "type": "whmcs-gateways",
+    "name": "paymenthooks",
+    "license": "MIT",
+    "category": "gateway",
+    "description": {
+        "name": "PaymentHooks",
+        "tagline": "Accept payments through PaymentHooks",
+        "long": "Connects WHMCS to a PaymentHooks deployment. PaymentHooks hosts the checkout, routes to the underlying gateway (Razorpay for INR and others), and handles subscriptions and refunds. This module creates hosted checkout sessions, redirects the client to pay, and reconciles invoices from signed webhooks.",
+        "features": [
+            "Hosted redirect checkout on your PaymentHooks domain",
+            "One-time payments with full and partial refunds",
+            "Recurring billing via mandates (PaymentHooks-driven subscriptions)",
+            "Signed webhook reconciliation with duplicate protection",
+            "Test and live key isolation"
+        ]
+    },
+    "logo": {
+        "filename": "logo.png"
+    },
+    "support": {
+        "homepage": "https:\/\/paymenthooks.com\/",
+        "docs_url": "https:\/\/paymenthooks.com\/docs"
+    },
+    "authors": [
+        {
+            "name": "mr-innovations"
+        }
+    ]
+}

@@ -1,0 +1,20 @@
+# OS / editor
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/
+*.swp
+
+# Local tooling / sessions
+.mrcoder/
+.claude/
+
+# Local config and secrets — never commit
+.env
+*.local.php
+*.log
+
+# Packaging artifacts
+*.zip
+/dist/
