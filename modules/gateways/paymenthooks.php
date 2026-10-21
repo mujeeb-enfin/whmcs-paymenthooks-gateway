@@ -152,7 +152,7 @@ function paymenthooks_config()
             'Size'         => '70',
             'Default'      => '',
             'Description'  => 'Optional. Full URL of a logo to show above the Pay button. '
-                . 'If blank, the module uses modules/gateways/paymenthooks/assets/logo.png when present, '
+                . 'If blank, the module uses modules/gateways/paymenthooks/logo.png when present, '
                 . 'otherwise no image is shown. (The logo on the PH payment page itself is set in your PH dashboard.)',
         ],
         'enableSubscriptions' => [
@@ -199,9 +199,9 @@ function paymenthooks_link($params)
     // dropped one in, else no image at all (no invented/placeholder logo).
     $logoUrl = trim($params['logoUrl'] ?? '');
     if ($logoUrl === '') {
-        $assetPath = __DIR__ . '/paymenthooks/assets/logo.png';
+        $assetPath = __DIR__ . '/paymenthooks/logo.png';
         if (is_file($assetPath)) {
-            $logoUrl = $systemUrl . '/modules/gateways/paymenthooks/assets/logo.png';
+            $logoUrl = $systemUrl . '/modules/gateways/paymenthooks/logo.png';
         }
     }
 

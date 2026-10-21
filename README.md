@@ -30,7 +30,12 @@ invoices from PaymentHooks webhooks.
    modules/gateways/callback/paymenthooks.php
    modules/gateways/paymenthooks/lib/*.php
    modules/gateways/paymenthooks/templates/pay_button.tpl
+   modules/gateways/paymenthooks/whmcs.json
+   modules/gateways/paymenthooks/logo.png
    ```
+   `whmcs.json` and `logo.png` live inside the module's own folder, so they never
+   collide with other gateways sharing `modules/gateways/`. The same `logo.png`
+   is used on the admin gateway list and above the client "Pay Now" button.
 2. In WHMCS admin: **Configuration > System Settings > Payment Gateways**,
    find **PaymentHooks** under "All Payment Gateways", and activate it.
 3. Fill in the settings (see below). The support tables are created
