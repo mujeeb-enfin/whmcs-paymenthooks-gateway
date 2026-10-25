@@ -2,10 +2,10 @@
 /**
  * PaymentHooks payment gateway module for WHMCS 8.x
  * --------------------------------------------------
- * Connects a WHMCS install to a PaymentHooks (PH) deployment. PH performs the
- * actual payment, hosted checkout, gateway routing, subscriptions and refunds.
- * This module creates PH checkout sessions, redirects the client to PH's hosted
- * page, and reconciles WHMCS invoices from PH webhooks (see callback/paymenthooks.php).
+ * Connects a WHMCS install to PaymentHooks (PH). PH performs the payment,
+ * hosted checkout, gateway routing, subscriptions and refunds. This module
+ * creates PH checkout sessions, redirects the client to PH's hosted page, and
+ * reconciles WHMCS invoices from PH webhooks (see callback/paymenthooks.php).
  *
  * Gateway API 1.1. Compatible with PHP 7.4 - 8.x.
  *
@@ -16,14 +16,10 @@ if (!defined('WHMCS')) {
     die('This file cannot be accessed directly');
 }
 
-require_once __DIR__ . '/paymenthooks/lib/Config.php';
-require_once __DIR__ . '/paymenthooks/lib/Logger.php';
-require_once __DIR__ . '/paymenthooks/lib/Client.php';
-require_once __DIR__ . '/paymenthooks/lib/Signature.php';
-require_once __DIR__ . '/paymenthooks/lib/Schema.php';
-require_once __DIR__ . '/paymenthooks/lib/InvoiceMapper.php';
+require_once __DIR__ . '/paymenthooks/lib/bootstrap.php';
 
 use WHMCS\Database\Capsule;
+use PaymentHooks\ApiException;
 use PaymentHooks\Config;
 use PaymentHooks\Client;
 use PaymentHooks\Logger;
@@ -40,7 +36,7 @@ function paymenthooks_MetaData()
         'APIVersion'                  => '1.1',
         // Cards are entered on the PH hosted page, never inside WHMCS.
         'DisableLocalCreditCardInput' => true,
-        // PH exposes no off-session charge API, so we do not store WHMCS tokens.
+        // PH has no off-session charge API, so WHMCS stores no tokens.
         'TokenisedStorage'            => false,
     ];
 }
@@ -51,85 +47,66 @@ function paymenthooks_MetaData()
  */
 function paymenthooks_config()
 {
-    // The webhook URL the merchant must paste into their PH dashboard.
-    $systemUrl = rtrim(\App::getSystemURL(), '/');
-    $webhookUrl = $systemUrl . '/modules/gateways/callback/paymenthooks.php';
+    $webhookUrl = rtrim(\App::getSystemURL(), '/') . '/modules/gateways/callback/paymenthooks.php';
 
     return [
         'FriendlyName' => [
             'Type'  => 'System',
             'Value' => 'PaymentHooks',
         ],
-        'mode' => [
-            'FriendlyName' => 'Mode',
-            'Type'         => 'dropdown',
-            'Options'      => [
-                'test' => 'Test',
-                'live' => 'Live',
-            ],
-            'Default'      => 'test',
-            'Description'  => 'Test uses sk_test_/pk_test_ keys; Live uses sk_live_/pk_live_ keys.',
-        ],
-        'customDomain' => [
-            'FriendlyName' => 'PaymentHooks Custom Domain',
-            'Type'         => 'text',
-            'Size'         => '40',
-            'Default'      => '',
-            'Description'  => 'Optional. e.g. payments.mr-innovations.com. '
-                . 'Leave blank to use the default PaymentHooks URL (paymenthooks.com). '
-                . 'HTTPS is always used; any scheme or trailing slash you enter is ignored.',
-        ],
-        'testSecretKey' => [
-            'FriendlyName' => 'Test Secret Key',
+        'secretKey' => [
+            'FriendlyName' => 'Secret Key',
             'Type'         => 'password',
-            'Size'         => '50',
-            'Description'  => 'sk_test_...',
+            'Size'         => '70',
+            'Description'  => 'phk_live_... from Developers > API Keys in PaymentHooks. Scopes: payments:read, '
+                . 'payments:write, customers:read, customers:write; for subscriptions also subscriptions:write, '
+                . 'products:read and products:write. Real or simulated payments follow the Platform Mode in your '
+                . 'PaymentHooks dashboard, not this key.',
         ],
-        'liveSecretKey' => [
-            'FriendlyName' => 'Live Secret Key',
+        'publishableKey' => [
+            'FriendlyName' => 'Publishable Key',
             'Type'         => 'password',
-            'Size'         => '50',
-            'Description'  => 'sk_live_...',
-        ],
-        'testPublishableKey' => [
-            'FriendlyName' => 'Test Publishable Key',
-            'Type'         => 'password',
-            'Size'         => '50',
-            'Description'  => 'pk_test_... (used for any client-side embed)',
-        ],
-        'livePublishableKey' => [
-            'FriendlyName' => 'Live Publishable Key',
-            'Type'         => 'password',
-            'Size'         => '50',
-            'Description'  => 'pk_live_...',
+            'Size'         => '70',
+            'Description'  => 'Optional. phk_pub_... Not used by the redirect checkout.',
         ],
         'webhookSecret' => [
             'FriendlyName' => 'Webhook Signing Secret',
             'Type'         => 'password',
-            'Size'         => '50',
-            'Description'  => 'The signing secret from your PH webhook endpoint.',
+            'Size'         => '70',
+            'Description'  => 'whsec_... shown when you add the Webhook URL below as an endpoint under '
+                . 'Developers > Webhooks in PaymentHooks.',
         ],
         'webhookUrlDisplay' => [
             'FriendlyName' => 'Webhook URL',
             'Type'         => 'text',
             'Size'         => '70',
             'Default'      => $webhookUrl,
-            'Description'  => 'Read-only. Add this URL as a webhook endpoint in your PH dashboard, '
-                . 'then copy its signing secret into the field above.',
+            'Description'  => 'Read-only. Add this URL as a webhook endpoint in PaymentHooks, subscribed to '
+                . 'checkout.session.completed, checkout.session.payment_failed, payment.refunded, '
+                . 'subscription.renewed, subscription.renewal_failed and subscription.cancelled.',
+        ],
+        'customDomain' => [
+            'FriendlyName' => 'Custom Checkout Domain',
+            'Type'         => 'text',
+            'Size'         => '40',
+            'Default'      => '',
+            'Description'  => 'Optional, e.g. pay.example.com, if you verified a custom domain in PaymentHooks. '
+                . 'Clients are sent to the checkout page on this domain; API calls always go to paymenthooks.com.',
         ],
         'convenienceFeePercent' => [
             'FriendlyName' => 'Convenience Fee %',
             'Type'         => 'text',
             'Size'         => '6',
             'Default'      => '',
-            'Description'  => 'Optional. Percentage added to each payment (e.g. 2 for 2%).',
+            'Description'  => 'Optional. Percentage added on top of each payment (e.g. 2 for 2%). '
+                . 'The invoice is credited with its balance; the surcharge is noted in the Gateway Log.',
         ],
         'descriptionTemplate' => [
             'FriendlyName' => 'Description Template',
             'Type'         => 'text',
             'Size'         => '50',
             'Default'      => 'Invoice {invoiceid}',
-            'Description'  => 'Sent to the PH checkout session. {invoiceid} is replaced.',
+            'Description'  => 'Stored on the checkout session as metadata.description. {invoiceid} is replaced.',
         ],
         'checkoutHeading' => [
             'FriendlyName' => 'Checkout Heading',
@@ -152,77 +129,76 @@ function paymenthooks_config()
             'Size'         => '70',
             'Default'      => '',
             'Description'  => 'Optional. Full URL of a logo to show above the Pay button. '
-                . 'If blank, the module uses modules/gateways/paymenthooks/logo.png when present, '
-                . 'otherwise no image is shown. (The logo on the PH payment page itself is set in your PH dashboard.)',
+                . 'If blank, modules/gateways/paymenthooks/logo.png is used when present.',
         ],
         'enableSubscriptions' => [
             'FriendlyName' => 'Enable Subscriptions',
             'Type'         => 'yesno',
-            'Description'  => 'Tick to let recurring products set up a PH subscription (mandate) at checkout.',
+            'Description'  => 'Tick to let recurring products start a PaymentHooks subscription at checkout.',
         ],
         'paymentModePolicy' => [
             'FriendlyName' => 'Payment Mode',
             'Type'         => 'dropdown',
             'Options'      => [
                 'auto'         => 'Auto — subscription for recurring products, one-time otherwise',
-                'subscription' => 'Subscription only — force every payment through a mandate',
-                'payment'      => 'One-time only — never set up a subscription',
+                'subscription' => 'Subscription only — every invoice must contain a recurring product',
+                'payment'      => 'One-time only — never start a subscription',
             ],
             'Default'      => 'auto',
-            'Description'  => 'Controls how each checkout session is opened. '
-                . '"Subscription only" forces a mandate on every invoice and requires Enable Subscriptions to be ticked.',
+            'Description'  => '"Subscription only" requires Enable Subscriptions; an invoice without a recurring '
+                . 'product then fails at checkout instead of being charged once.',
         ],
         'logging' => [
             'FriendlyName' => 'Debug Logging',
             'Type'         => 'yesno',
-            'Description'  => 'Tick to log API calls to Utilities > Logs > Module Log.',
+            'Description'  => 'Tick to log every API call to Utilities > Logs > Module Log. Errors are always logged.',
         ],
     ];
 }
 
 /**
- * Renders the "Pay Now" button on the invoice. For a redirect gateway this posts
- * to the callback handler, which creates the PH checkout session on click and
- * redirects the client to the hosted page. We do NOT create the session here, so
- * that merely viewing the invoice does not spawn orphan sessions.
+ * Renders the "Pay Now" button on the invoice. The button posts to the
+ * callback, which creates the PH checkout session on click, so viewing an
+ * invoice never creates a session.
  */
 function paymenthooks_link($params)
 {
     Schema::ensure();
+
+    $problems = Config::fromParams($params)->validate();
+    if ($problems) {
+        (new Logger('paymenthooks', true))->error('config', [], implode(' ', $problems));
+        return '<div class="alert alert-danger" id="paymenthooks_pay_unavailable">'
+            . 'Online payment is unavailable. Please contact us.</div>';
+    }
 
     $systemUrl  = rtrim($params['systemurl'], '/');
     $actionUrl  = $systemUrl . '/modules/gateways/callback/paymenthooks.php';
     $invoiceId  = (int) $params['invoiceid'];
     $buttonText = htmlspecialchars($params['langpaynow'] ?? 'Pay Now', ENT_QUOTES);
 
-    // Resolve the logo: explicit URL wins, else a bundled asset if the merchant
-    // dropped one in, else no image at all (no invented/placeholder logo).
     $logoUrl = trim($params['logoUrl'] ?? '');
-    if ($logoUrl === '') {
-        $assetPath = __DIR__ . '/paymenthooks/logo.png';
-        if (is_file($assetPath)) {
-            $logoUrl = $systemUrl . '/modules/gateways/paymenthooks/logo.png';
-        }
+    if ($logoUrl === '' && is_file(__DIR__ . '/paymenthooks/logo.png')) {
+        $logoUrl = $systemUrl . '/modules/gateways/paymenthooks/logo.png';
     }
-
     $heading = trim($params['checkoutHeading'] ?? '');
     $blurb   = trim($params['checkoutBlurb'] ?? '');
 
     $logoHtml = $logoUrl !== ''
-        ? '<div class="paymenthooks-logo" style="margin-bottom:10px"><img src="'
+        ? '<div class="paymenthooks-logo" id="paymenthooks_pay_logo" style="margin-bottom:10px"><img src="'
             . htmlspecialchars($logoUrl, ENT_QUOTES) . '" alt="PaymentHooks" style="max-height:40px"></div>'
         : '';
     $headingHtml = $heading !== ''
-        ? '<div class="paymenthooks-heading" style="font-weight:600;margin-bottom:4px">'
+        ? '<div class="paymenthooks-heading" id="paymenthooks_pay_heading" style="font-weight:600;margin-bottom:4px">'
             . htmlspecialchars($heading, ENT_QUOTES) . '</div>'
         : '';
     $blurbHtml = $blurb !== ''
-        ? '<div class="paymenthooks-blurb" style="color:#666;margin-bottom:10px">'
+        ? '<div class="paymenthooks-blurb" id="paymenthooks_pay_blurb" style="color:#666;margin-bottom:10px">'
             . nl2br(htmlspecialchars($blurb, ENT_QUOTES)) . '</div>'
         : '';
 
     $tpl = file_get_contents(__DIR__ . '/paymenthooks/templates/pay_button.tpl');
-    $html = strtr($tpl, [
+    return strtr($tpl, [
         '{logo_html}'    => $logoHtml,
         '{heading_html}' => $headingHtml,
         '{blurb_html}'   => $blurbHtml,
@@ -230,88 +206,89 @@ function paymenthooks_link($params)
         '{invoice_id}'   => $invoiceId,
         '{button_text}'  => $buttonText,
     ]);
-
-    return $html;
 }
 
 /**
- * Refund handler. Called when an admin clicks Refund on a transaction.
- * Full refund if no amount constraint; partial when WHMCS passes an amount.
+ * Refund handler, called when an admin refunds a transaction. WHMCS always
+ * passes the amount (full or partial); PaymentHooks requires it.
  */
 function paymenthooks_refund($params)
 {
     Schema::ensure();
 
-    $logger = new Logger('paymenthooks', !empty($params['logging']));
     $config = Config::fromParams($params);
+    $logger = new Logger('paymenthooks', $config->logging);
 
-    // The transaction id WHMCS stored at capture is the PH payment id (pay_...).
-    $paymentId = $params['transid'];
-    $amount    = isset($params['amount']) ? (float) $params['amount'] : null;
-    $currency  = $params['currency'] ?? '';
-
-    $body = [];
-    if ($amount !== null && $amount > 0) {
-        $body['amount'] = InvoiceMapper::toMinorUnits($amount, $currency);
-    }
-    $body['reason'] = 'Refund issued from WHMCS admin for invoice ' . ($params['invoiceid'] ?? '');
-
-    try {
-        $client = new Client($config, $logger);
-        $resp = $client->post('/payments/' . rawurlencode($paymentId) . '/refund', $body, 'refund-' . $paymentId . '-' . ($amount ?? 'full'));
-    } catch (\Throwable $e) {
+    // The transaction id WHMCS stored at payment is the PH payment id.
+    $paymentId = trim((string) ($params['transid'] ?? ''));
+    $currency  = strtoupper(trim((string) ($params['currency'] ?? '')));
+    $amount    = (float) ($params['amount'] ?? 0);
+    if ($paymentId === '' || $currency === '' || $amount <= 0) {
         return [
             'status'  => 'declined',
-            'rawdata' => $e->getMessage(),
+            'rawdata' => 'Refund needs the PaymentHooks payment id, a currency and a positive amount.',
         ];
     }
 
-    $data = $resp['data'] ?? [];
-    $refundId = $data['id'] ?? ($data['refundId'] ?? $paymentId);
-
-    return [
-        'status'  => 'success',
-        'transid' => $refundId,
-        'rawdata' => $resp,
+    $amountMinor = InvoiceMapper::toMinorUnits($amount, $currency);
+    $body = [
+        'amount' => $amountMinor,
+        'reason' => 'Refund issued from WHMCS for invoice ' . ($params['invoiceid'] ?? ''),
     ];
+    // Payment + amount + refunds already recorded: a double click is one
+    // refund, a second intended refund of the same amount is a new one.
+    $refundsSoFar = (int) Capsule::table('tblaccounts')
+        ->where('invoiceid', (int) ($params['invoiceid'] ?? 0))
+        ->where('gateway', 'paymenthooks')
+        ->where('amountout', '>', 0)
+        ->count();
+
+    try {
+        $resp = (new Client($config, $logger))->post(
+            '/payments/' . rawurlencode($paymentId) . '/refund',
+            $body,
+            'refund-' . $paymentId . '-' . $amountMinor . '-' . $refundsSoFar
+        );
+    } catch (ApiException $e) {
+        return ['status' => 'declined', 'rawdata' => $e->errorCode . ': ' . $e->getMessage()];
+    }
+
+    $refundId = (string) ($resp['data']['id'] ?? '');
+    if ($refundId === '') {
+        return ['status' => 'error', 'rawdata' => $resp];
+    }
+    return ['status' => 'success', 'transid' => $refundId, 'rawdata' => $resp];
 }
 
 /**
- * Cancels a PH subscription when the WHMCS service is cancelled/terminated.
- * Relies on a stored mapping of the WHMCS service to the PH subscription id.
+ * Cancels the PH subscription when the WHMCS service is cancelled or
+ * terminated. WHMCS passes the id stored on tblhosting.subscriptionid.
  */
 function paymenthooks_cancelSubscription($params)
 {
     Schema::ensure();
 
-    $logger = new Logger('paymenthooks', !empty($params['logging']));
     $config = Config::fromParams($params);
+    $logger = new Logger('paymenthooks', $config->logging);
 
-    // WHMCS passes the subscription id it stored at setup time.
-    $subscriptionId = $params['subscriptionID'] ?? '';
+    $subscriptionId = trim((string) ($params['subscriptionID'] ?? ''));
     if ($subscriptionId === '') {
-        return [
-            'status'  => 'error',
-            'rawdata' => 'No PaymentHooks subscription id stored for this service.',
-        ];
+        return ['status' => 'error', 'rawdata' => 'No PaymentHooks subscription id stored for this service.'];
     }
 
     try {
-        $client = new Client($config, $logger);
-        $resp = $client->post(
+        // The service is ending, so billing stops now rather than at period end.
+        $resp = (new Client($config, $logger))->post(
             '/subscriptions/' . rawurlencode($subscriptionId) . '/cancel',
-            ['atPeriodEnd' => false],
-            'cancel-' . $subscriptionId
+            ['cancelAtPeriodEnd' => false]
         );
-    } catch (\Throwable $e) {
-        return [
-            'status'  => 'error',
-            'rawdata' => $e->getMessage(),
-        ];
+    } catch (ApiException $e) {
+        // Already cancelled at PaymentHooks (e.g. from its dashboard).
+        if ($e->errorCode === 'INVALID_STATE' && $e->httpStatus === 422) {
+            return ['status' => 'success', 'rawdata' => $e->response];
+        }
+        return ['status' => 'error', 'rawdata' => $e->errorCode . ': ' . $e->getMessage()];
     }
 
-    return [
-        'status'  => 'success',
-        'rawdata' => $resp,
-    ];
+    return ['status' => 'success', 'rawdata' => $resp];
 }

@@ -1,8 +1,12 @@
 <?php
 /**
- * PaymentHooks REST client. cURL-based (no Composer deps), enforces HTTPS,
- * sends the Bearer secret key, retries on 429/5xx with backoff, and attaches
- * an idempotency key on create calls.
+ * PaymentHooks REST client. cURL-based (no Composer deps), HTTPS only, Bearer
+ * secret key, optional Idempotency-Key header.
+ *
+ * One request per call, no automatic retries: a failure throws ApiException
+ * with the server's error code and is logged. Retrying is left to the caller
+ * (WHMCS re-runs the action, PaymentHooks redelivers webhooks), so a timed-out
+ * create is never silently sent twice.
  */
 
 namespace PaymentHooks;
@@ -19,8 +23,6 @@ class Client
     private $logger;
     /** @var int */
     private $timeout = 30;
-    /** @var int */
-    private $maxRetries = 3;
 
     public function __construct(Config $config, Logger $logger)
     {
@@ -47,8 +49,9 @@ class Client
      */
     private function request(string $method, string $path, ?array $body, ?string $idempotencyKey): array
     {
-        if ($this->config->secretKey === '') {
-            throw new ApiException('PaymentHooks secret key is not configured for ' . $this->config->mode . ' mode.');
+        $problems = $this->config->validate();
+        if ($problems) {
+            throw new ApiException('PaymentHooks module is misconfigured: ' . implode(' ', $problems), 'MODULE_MISCONFIGURED');
         }
 
         $url = $this->config->baseUrl . $path;
@@ -58,94 +61,68 @@ class Client
             'Accept: application/json',
         ];
         if ($idempotencyKey !== null && $idempotencyKey !== '') {
-            // Keep within PH's 255-char limit and allowed charset.
-            $headers[] = 'Idempotency-Key: ' . substr(preg_replace('/[^A-Za-z0-9_\-.]/', '-', $idempotencyKey), 0, 255);
+            $headers[] = 'Idempotency-Key: ' . self::idempotencyKey($idempotencyKey);
         }
 
-        $payload = $body !== null ? json_encode($body, JSON_UNESCAPED_SLASHES) : null;
+        $payload = null;
+        if ($body !== null) {
+            $payload = json_encode($body, JSON_UNESCAPED_SLASHES);
+            if ($payload === false) {
+                throw new ApiException('Request body could not be encoded as JSON: ' . json_last_error_msg(), 'ENCODE_FAILED');
+            }
+        }
         $redact = [$this->config->secretKey, $this->config->webhookSecret];
+        $summary = ['method' => $method, 'url' => $url, 'body' => $body];
+        $action = 'api-' . strtolower($method);
 
-        $attempt = 0;
-        $lastError = '';
-        while ($attempt < $this->maxRetries) {
-            $attempt++;
-
-            $ch = curl_init($url);
-            curl_setopt_array($ch, [
-                CURLOPT_RETURNTRANSFER => true,
-                CURLOPT_CUSTOMREQUEST  => $method,
-                CURLOPT_HTTPHEADER     => $headers,
-                CURLOPT_TIMEOUT        => $this->timeout,
-                CURLOPT_SSL_VERIFYPEER => true,
-                CURLOPT_SSL_VERIFYHOST => 2,
-            ]);
-            if ($payload !== null) {
-                curl_setopt($ch, CURLOPT_POSTFIELDS, $payload);
-            }
-
-            $raw   = curl_exec($ch);
-            $errno = curl_errno($ch);
-            $err   = curl_error($ch);
-            $http  = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
-            curl_close($ch);
-
-            if ($errno !== 0) {
-                $lastError = 'Transport error: ' . $err;
-                if ($this->shouldRetry(0, $attempt)) {
-                    $this->backoff($attempt);
-                    continue;
-                }
-                $this->logger->error('api-' . strtolower($method), $this->summarise($method, $url, $body), $lastError, $redact);
-                throw new ApiException($lastError);
-            }
-
-            $decoded = json_decode((string) $raw, true);
-            if (!is_array($decoded)) {
-                $decoded = ['data' => null, 'error' => ['code' => 'INVALID_PAYLOAD', 'message' => 'Non-JSON response', 'details' => substr((string) $raw, 0, 500)]];
-            }
-
-            if ($http >= 200 && $http < 300) {
-                $this->logger->call('api-' . strtolower($method), $this->summarise($method, $url, $body), $decoded, $redact);
-                return $decoded;
-            }
-
-            // Retry on rate limit / transient server errors.
-            if ($this->shouldRetry($http, $attempt)) {
-                $this->backoff($attempt);
-                continue;
-            }
-
-            $code = $decoded['error']['code'] ?? ('HTTP_' . $http);
-            $msg  = $decoded['error']['message'] ?? ('HTTP ' . $http);
-            $this->logger->error('api-' . strtolower($method), $this->summarise($method, $url, $body), $decoded, $redact);
-            throw new ApiException($msg, $code, $http, $decoded);
+        $ch = curl_init($url);
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_CUSTOMREQUEST  => $method,
+            CURLOPT_HTTPHEADER     => $headers,
+            CURLOPT_TIMEOUT        => $this->timeout,
+            CURLOPT_SSL_VERIFYPEER => true,
+            CURLOPT_SSL_VERIFYHOST => 2,
+            CURLOPT_PROTOCOLS      => CURLPROTO_HTTPS,
+        ]);
+        if ($payload !== null) {
+            curl_setopt($ch, CURLOPT_POSTFIELDS, $payload);
         }
 
-        throw new ApiException($lastError !== '' ? $lastError : 'Request failed after retries');
-    }
+        $raw   = curl_exec($ch);
+        $errno = curl_errno($ch);
+        $err   = curl_error($ch);
+        $http  = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_close($ch);
 
-    private function shouldRetry(int $http, int $attempt): bool
-    {
-        if ($attempt >= $this->maxRetries) {
-            return false;
+        if ($errno !== 0) {
+            $message = 'Could not reach PaymentHooks: ' . $err;
+            $this->logger->error($action, $summary, $message, $redact);
+            throw new ApiException($message, 'CONNECTION_FAILED');
         }
-        return $http === 0 || $http === 429 || $http === 500 || $http === 502 || $http === 503;
+
+        $decoded = json_decode((string) $raw, true);
+        if (!is_array($decoded)) {
+            $message = 'PaymentHooks returned a non-JSON response (HTTP ' . $http . ').';
+            $this->logger->error($action, $summary, substr((string) $raw, 0, 500), $redact);
+            throw new ApiException($message, 'UNEXPECTED_RESPONSE', $http);
+        }
+
+        if ($http >= 200 && $http < 300) {
+            $this->logger->call($action, $summary, $decoded, $redact);
+            return $decoded;
+        }
+
+        $code = (string) ($decoded['error']['code'] ?? ('HTTP_' . $http));
+        $msg  = (string) ($decoded['error']['message'] ?? ('HTTP ' . $http));
+        $this->logger->error($action, $summary, $decoded, $redact);
+        throw new ApiException($msg, $code, $http, $decoded);
     }
 
-    private function backoff(int $attempt): void
+    /** Keeps a key within PaymentHooks' 200-character limit and a safe charset. */
+    public static function idempotencyKey(string $key): string
     {
-        // 0.5s, 1s, 2s ... capped.
-        $ms = (int) min(2000, 250 * (2 ** $attempt));
-        usleep($ms * 1000);
-    }
-
-    private function summarise(string $method, string $url, ?array $body): array
-    {
-        return [
-            'method' => $method,
-            'url'    => $url,
-            'body'   => $body,
-        ];
+        return substr((string) preg_replace('/[^A-Za-z0-9_\-.]/', '-', $key), 0, 200);
     }
 }
 

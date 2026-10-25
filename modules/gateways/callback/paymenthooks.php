@@ -4,8 +4,8 @@
  *
  *  1. action=checkout (POST from the invoice "Pay Now" button): create a PH
  *     checkout session for the invoice and redirect the client to the hosted page.
- *  2. Webhook receiver (POST from PH with X-PaymentHooks-Signature): verify the
- *     signature, dedupe, and reconcile the WHMCS invoice.
+ *  2. Webhook receiver (POST from the PH webhook endpoint with
+ *     X-PaymentHooks-Signature): verify, dedupe, and reconcile the WHMCS invoice.
  */
 
 use WHMCS\Database\Capsule;
@@ -13,9 +13,11 @@ use PaymentHooks\Config;
 use PaymentHooks\Client;
 use PaymentHooks\ApiException;
 use PaymentHooks\Logger;
+use PaymentHooks\GatewayLog;
 use PaymentHooks\Signature;
 use PaymentHooks\Schema;
 use PaymentHooks\InvoiceMapper;
+use PaymentHooks\CheckoutBuilder;
 use PaymentHooks\PriceResolver;
 use PaymentHooks\WebhookRouter;
 
@@ -23,34 +25,34 @@ require_once __DIR__ . '/../../../init.php';
 require_once __DIR__ . '/../../../includes/gatewayfunctions.php';
 require_once __DIR__ . '/../../../includes/invoicefunctions.php';
 
-require_once __DIR__ . '/../paymenthooks/lib/Config.php';
-require_once __DIR__ . '/../paymenthooks/lib/Logger.php';
-require_once __DIR__ . '/../paymenthooks/lib/Client.php';
-require_once __DIR__ . '/../paymenthooks/lib/Signature.php';
-require_once __DIR__ . '/../paymenthooks/lib/Schema.php';
-require_once __DIR__ . '/../paymenthooks/lib/InvoiceMapper.php';
-require_once __DIR__ . '/../paymenthooks/lib/PriceResolver.php';
-require_once __DIR__ . '/../paymenthooks/lib/SubscriptionSync.php';
-require_once __DIR__ . '/../paymenthooks/lib/WebhookRouter.php';
+require_once __DIR__ . '/../paymenthooks/lib/bootstrap.php';
 
 $gatewayModuleName = 'paymenthooks';
 $gatewayParams = getGatewayVariables($gatewayModuleName);
 
-if (!$gatewayParams['type']) {
+if (empty($gatewayParams['type'])) {
+    // Activity Log, not Gateway Log: logTransaction needs an active gateway.
+    logActivity('PaymentHooks: callback called but the PaymentHooks gateway is not activated in WHMCS.');
     http_response_code(503);
     die('PaymentHooks module not activated');
 }
 
-Schema::ensure();
+try {
+    Schema::ensure();
+} catch (\Throwable $e) {
+    logTransaction($gatewayModuleName, ['error' => $e->getMessage()], 'Error');
+    http_response_code(500);
+    die('Retry');
+}
 
 $config = Config::fromParams($gatewayParams);
-$logger = new Logger($gatewayModuleName, !empty($gatewayParams['logging']));
+$logger = new Logger($gatewayModuleName, $config->logging);
 
 // Route: a "Pay Now" click carries action=checkout; everything else is a webhook.
 if (($_POST['action'] ?? '') === 'checkout' && isset($_POST['invoice_id'])) {
     handle_checkout_click($config, $logger, $gatewayParams);
 } else {
-    handle_webhook($config, $logger);
+    handle_webhook($config, $logger, (string) file_get_contents('php://input'));
 }
 
 /**
@@ -60,114 +62,67 @@ function handle_checkout_click(Config $config, Logger $logger, array $params): v
 {
     $invoiceId = (int) $_POST['invoice_id'];
 
-    // A client must be logged in, and must own this invoice. An anonymous POST
-    // (uid absent/0) is rejected outright — otherwise anyone could drive checkout
-    // for an arbitrary invoice and read its line items/amount.
+    // Only the logged-in owner of the invoice may start its checkout.
     $clientId = (int) ($_SESSION['uid'] ?? 0);
     $invoice = Capsule::table('tblinvoices')->where('id', $invoiceId)->first();
     if ($clientId <= 0 || !$invoice || (int) $invoice->userid !== $clientId) {
         redirect_to_invoice($invoiceId, 'paymentfailed');
-        return;
     }
     if ($invoice->status === 'Paid') {
         redirect_to_invoice($invoiceId, 'paymentsuccess');
-        return;
     }
-
-    $systemUrl = rtrim($params['systemurl'], '/');
-    $currency  = currency_code_for_invoice($invoiceId);
-
-    // Reuse an open session on refresh rather than spawning duplicates.
-    $existing = Capsule::table('mod_paymenthooks_sessions')
-        ->where('invoice_id', $invoiceId)
-        ->where('status', 'open')
-        ->orderBy('id', 'desc')
-        ->first();
+    if ($invoice->status !== 'Unpaid') {
+        // Cancelled, Refunded, Collections or Draft invoices are not payable.
+        redirect_to_invoice($invoiceId, 'paymentfailed');
+    }
 
     try {
         $client = new Client($config, $logger);
-
-        if ($existing && $existing->session_id) {
-            // Confirm it is still open at PH; if so, reuse its hosted URL.
-            try {
-                $check = $client->get('/checkout-sessions/' . rawurlencode($existing->session_id));
-                $status = $check['data']['status'] ?? 'expired';
-                $url = $check['data']['url'] ?? '';
-                if ($status === 'open' && $url !== '') {
-                    header('Location: ' . $url);
-                    exit;
-                }
-            } catch (ApiException $e) {
-                // fall through and create a new session
-            }
-        }
-
-        $customerId = resolve_customer_id($client, $invoice);
-        $customerEmail = (string) Capsule::table('tblclients')->where('id', $invoice->userid)->value('email');
+        $currency = WebhookRouter::invoiceCurrency((int) $invoice->userid);
         $mapped = InvoiceMapper::buildLineItems($invoiceId, $currency);
-
         $mode = $config->resolveCheckoutMode(invoice_has_recurring_item($invoiceId));
 
-        $description = strtr($config->descriptionTemplate, ['{invoiceid}' => $invoiceId]);
+        // PaymentHooks has taken (or is taking) a payment whose webhook has not
+        // arrived yet: never start a second charge.
+        if (payment_in_flight($client, $invoiceId)) {
+            redirect_to_invoice($invoiceId, 'paymentsuccess');
+        }
 
-        $body = [
-            'mode'          => $mode,
-            'currency'      => strtolower($currency),
-            'customerEmail' => $customerEmail !== '' ? $customerEmail : null,
-            'successUrl'    => $systemUrl . '/viewinvoice.php?id=' . $invoiceId . '&paymentsuccess=true',
-            'cancelUrl'     => $systemUrl . '/viewinvoice.php?id=' . $invoiceId . '&paymentfailed=true',
-            'webhookUrl'    => $systemUrl . '/modules/gateways/callback/paymenthooks.php',
-            'metadata'      => [
-                'whmcs_invoice_id' => (string) $invoiceId,
-                'whmcs_system_url' => $systemUrl,
-            ],
-        ];
+        // Reuse the open session for this exact balance on refresh/back.
+        $reuse = reusable_session_url($client, $config, $invoiceId, $mapped['subtotal_minor'], $mode);
+        if ($reuse !== '') {
+            header('Location: ' . $reuse);
+            exit;
+        }
 
-        // Subscription mode needs a PH recurring priceId to establish the mandate.
-        // Fall back to one-time if the mapping can't be built, so checkout still
-        // completes rather than opening a broken subscription session.
+        $priceId = '';
         if ($mode === 'subscription') {
-            $resolver = new PriceResolver($client, $logger);
-            $priceId = $resolver->resolveForInvoice($invoiceId, $currency);
-            if ($priceId !== '') {
-                $body['priceId'] = $priceId;
-            } else {
-                $logger->error('subscription-no-price', ['invoice_id' => $invoiceId], 'No PH price resolved; falling back to one-time payment');
-                $mode = 'payment';
-                $body['mode'] = 'payment';
-            }
+            $priceId = (new PriceResolver($client, $logger))->resolveForInvoice($invoiceId, $currency);
         }
 
-        // One-time (and the fallback) use line items.
-        if ($mode === 'payment') {
-            $body['lineItems'] = $mapped['lineItems'];
-        }
+        $email = trim((string) Capsule::table('tblclients')->where('id', $invoice->userid)->value('email'));
+        $body = CheckoutBuilder::build(
+            $config,
+            $invoiceId,
+            $currency,
+            $mapped,
+            $mode,
+            (string) $params['systemurl'],
+            resolve_customer_id($client, (int) $invoice->userid),
+            $email,
+            $priceId
+        );
 
-        if ($customerId !== '') {
-            $body['customerId'] = $customerId;
-        }
-        if ($config->convenienceFeePercent !== null && $config->convenienceFeePercent > 0) {
-            $body['convenienceFee'] = (int) round($mapped['subtotal_minor'] * $config->convenienceFeePercent / 100);
-        }
+        // Unique per attempt: guards one create against a double submit, while
+        // a later attempt (after expiry or a balance change) gets a new session.
+        $attemptSeq = (int) Capsule::table('mod_paymenthooks_sessions')->where('invoice_id', $invoiceId)->count();
+        $idemKey = CheckoutBuilder::idempotencyKey(Schema::installId(), $invoiceId, $mapped['subtotal_minor'], $mode, $attemptSeq);
+        $resp = $client->post('/checkout-sessions', $body, $idemKey);
 
-        // Idempotency key scoped to THIS attempt: it guards the single create
-        // call against a transport-level retry, but must differ between attempts
-        // so a new session can be minted after a prior one expired/was cancelled.
-        // The prior-session count gives us that per-attempt uniqueness.
-        $attemptSeq = (int) Capsule::table('mod_paymenthooks_sessions')
-            ->where('invoice_id', $invoiceId)
-            ->count();
-        $idemKey = 'inv-' . $invoiceId . '-' . $mapped['subtotal_minor'] . '-' . $mode . '-' . $attemptSeq;
-        $resp = $client->post('/checkout-sessions', array_filter($body, static function ($v) {
-            return $v !== null;
-        }), $idemKey);
-
-        $session = $resp['data'] ?? [];
-        $sessionId = $session['id'] ?? '';
-        $url = $session['url'] ?? '';
-
-        if ($url === '') {
-            throw new ApiException('PaymentHooks did not return a checkout URL.');
+        $sessionId = (string) ($resp['data']['id'] ?? '');
+        $url = (string) ($resp['data']['url'] ?? '');
+        if ($sessionId === '' || $url === '') {
+            throw new ApiException('PaymentHooks did not return a checkout session id and URL.', 'UNEXPECTED_RESPONSE');
         }
 
         $now = time();
@@ -175,151 +130,247 @@ function handle_checkout_click(Config $config, Logger $logger, array $params): v
             'invoice_id' => $invoiceId,
             'session_id' => $sessionId,
             'status'     => 'open',
+            'fee_minor'  => (int) ($body['convenienceFee'] ?? 0),
             'created_at' => $now,
             'updated_at' => $now,
         ]);
 
-        header('Location: ' . $url);
+        header('Location: ' . $config->checkoutUrl($url));
         exit;
     } catch (\Throwable $e) {
-        $logger->error('checkout-click', ['invoice_id' => $invoiceId], $e->getMessage(), [$config->secretKey]);
+        $logger->error('checkout-click', ['invoice_id' => $invoiceId], get_class($e) . ': ' . $e->getMessage(), [$config->secretKey]);
+        logTransaction('paymenthooks', ['invoice_id' => $invoiceId, 'error' => $e->getMessage()], 'Checkout Error');
         redirect_to_invoice($invoiceId, 'paymentfailed');
     }
 }
 
 /**
- * Verifies and processes an incoming PH webhook.
+ * True when a session for this invoice is paid or being paid at PaymentHooks
+ * (status complete or pending) but WHMCS has not recorded the payment yet.
+ * Sessions marked completed locally were already applied by the webhook.
  */
-function handle_webhook(Config $config, Logger $logger): void
+function payment_in_flight(Client $client, int $invoiceId): bool
 {
-    $rawBody = file_get_contents('php://input');
-    $sigHeader = $_SERVER['HTTP_X_PAYMENTHOOKS_SIGNATURE'] ?? '';
-
-    if (!Signature::verify($rawBody, $sigHeader, $config->webhookSecret)) {
-        $logger->error('webhook-signature', ['header' => $sigHeader], 'Signature verification failed', [$config->webhookSecret]);
-        http_response_code(401);
-        die('Invalid signature');
-    }
-
-    $event = json_decode($rawBody, true);
-    if (!is_array($event)) {
-        http_response_code(400);
-        die('Invalid payload');
-    }
-
-    // Dedupe by event id (PH delivers at-least-once). event_id is the primary
-    // key, so we claim it with an insert FIRST: a duplicate insert throws, which
-    // means another delivery already owns this event -> acknowledge and stop.
-    // This closes the check-then-insert race. If an id is missing we synthesise a
-    // deterministic one from the body so retries of the same payload still dedupe.
-    $eventId = $event['id'] ?? '';
-    if ($eventId === '') {
-        $eventId = 'sha256:' . hash('sha256', $rawBody);
-    }
-
-    try {
-        Capsule::table('mod_paymenthooks_events')->insert([
-            'event_id'    => $eventId,
-            'type'        => $event['type'] ?? '',
-            'received_at' => time(),
-        ]);
-    } catch (\Throwable $e) {
-        // Duplicate key (or concurrent claim): already handled/claimed.
-        http_response_code(200);
-        die('Duplicate ignored');
-    }
-
-    $router = new WebhookRouter($logger);
-    try {
-        $handled = $router->dispatch($event);
-    } catch (\Throwable $e) {
-        // Release the claim so PH's retry can reprocess this event.
-        Capsule::table('mod_paymenthooks_events')->where('event_id', $eventId)->delete();
-        $logger->error('webhook-dispatch', $event, $e->getMessage());
-        http_response_code(500);
-        die('Processing error');
-    }
-
-    if (!$handled) {
-        // Handler asked for a retry: drop the claim so the next delivery runs.
-        Capsule::table('mod_paymenthooks_events')->where('event_id', $eventId)->delete();
-    }
-
-    http_response_code($handled ? 200 : 500);
-    echo $handled ? 'OK' : 'Retry';
-}
-
-/* ----------------------------------------------------------------------- */
-
-/** Creates or reuses a PH customer for the invoice's client. */
-function resolve_customer_id(Client $client, $invoice): string
-{
-    $client_row = Capsule::table('tblclients')->where('id', $invoice->userid)->first();
-    if (!$client_row) {
-        return '';
-    }
-
-    $email = trim((string) $client_row->email);
-    if ($email === '') {
-        return '';
-    }
-
-    $name = trim($client_row->firstname . ' ' . $client_row->lastname);
-    try {
-        $resp = $client->post('/customers', [
-            'name'    => $name !== '' ? $name : $email,
-            'email'   => $email,
-            'country' => $client_row->country ?: null,
-        ], 'cust-' . $invoice->userid);
-        return $resp['data']['id'] ?? '';
-    } catch (ApiException $e) {
-        // Duplicate email: look the customer up and reuse it.
-        if ($e->errorCode === 'DUPLICATE_EMAIL' || $e->httpStatus === 409) {
-            try {
-                $list = $client->get('/customers', ['email' => $email, 'pageSize' => 1]);
-                $rows = $list['data'] ?? [];
-                if (isset($rows[0]['id'])) {
-                    return $rows[0]['id'];
-                }
-            } catch (ApiException $e2) {
-                // fall through
-            }
+    $rows = Capsule::table('mod_paymenthooks_sessions')
+        ->where('invoice_id', $invoiceId)
+        ->whereIn('status', ['open', 'pending', 'complete'])
+        ->orderBy('id', 'desc')
+        ->limit(5)
+        ->get();
+    foreach ($rows as $row) {
+        if (!$row->session_id) {
+            continue;
         }
-        return '';
-    }
-}
-
-function currency_code_for_invoice(int $invoiceId): string
-{
-    $row = Capsule::table('tblinvoices')
-        ->join('tblclients', 'tblclients.id', '=', 'tblinvoices.userid')
-        ->join('tblcurrencies', 'tblcurrencies.id', '=', 'tblclients.currency')
-        ->where('tblinvoices.id', $invoiceId)
-        ->value('tblcurrencies.code');
-    return $row ? strtoupper($row) : 'INR';
-}
-
-function invoice_has_recurring_item(int $invoiceId): bool
-{
-    // A hosting line whose product has a non-"onetime" billing cycle implies recurring.
-    $relIds = Capsule::table('tblinvoiceitems')
-        ->where('invoiceid', $invoiceId)
-        ->where('type', 'Hosting')
-        ->pluck('relid')
-        ->all();
-    if (!$relIds) {
-        return false;
-    }
-    $cycles = Capsule::table('tblhosting')
-        ->whereIn('id', $relIds)
-        ->pluck('billingcycle')
-        ->all();
-    foreach ($cycles as $cycle) {
-        if ($cycle && strtolower($cycle) !== 'one time' && strtolower($cycle) !== 'free') {
+        $s = $client->get('/checkout-sessions/' . rawurlencode($row->session_id))['data'] ?? [];
+        $status = (string) ($s['status'] ?? '');
+        if ($status === 'complete' || $status === 'pending') {
+            Capsule::table('mod_paymenthooks_sessions')
+                ->where('id', $row->id)
+                ->update(['status' => $status, 'updated_at' => time()]);
             return true;
         }
     }
     return false;
+}
+
+/**
+ * Hosted URL of this invoice's latest session if it is still open at PH, not
+ * about to expire, and was opened for the same balance and mode, else ''.
+ */
+function reusable_session_url(Client $client, Config $config, int $invoiceId, int $subtotalMinor, string $mode): string
+{
+    $existing = Capsule::table('mod_paymenthooks_sessions')
+        ->where('invoice_id', $invoiceId)
+        ->where('status', 'open')
+        ->orderBy('id', 'desc')
+        ->first();
+    if (!$existing || !$existing->session_id) {
+        return '';
+    }
+
+    $check = $client->get('/checkout-sessions/' . rawurlencode($existing->session_id));
+    $s = $check['data'] ?? [];
+    $expiresAt = isset($s['expiresAt']) ? strtotime((string) $s['expiresAt']) : false;
+    // A minute of margin so the client is not sent to a page about to expire.
+    $stillOpen = ($s['status'] ?? '') === 'open' && $expiresAt !== false && $expiresAt > time() + 60;
+    $sameBalance = (int) ($s['subtotal'] ?? -1) === $subtotalMinor;
+    $sameMode = ($s['mode'] ?? '') === $mode;
+    if ($stillOpen && $sameBalance && $sameMode && !empty($s['url'])) {
+        return $config->checkoutUrl((string) $s['url']);
+    }
+
+    // Expired or for an old balance: never reuse it. (Paid sessions were
+    // caught by payment_in_flight before this.)
+    Capsule::table('mod_paymenthooks_sessions')
+        ->where('id', $existing->id)
+        ->update(['status' => 'stale', 'updated_at' => time()]);
+    return '';
+}
+
+/**
+ * Verifies and processes an incoming PH webhook.
+ */
+function handle_webhook(Config $config, Logger $logger, string $rawBody): void
+{
+    $sigHeader = (string) ($_SERVER['HTTP_X_PAYMENTHOOKS_SIGNATURE'] ?? '');
+    $secrets = [$config->secretKey, $config->webhookSecret];
+    $log = new GatewayLog();
+    $base = [
+        'delivery' => (string) ($_SERVER['HTTP_X_PAYMENTHOOKS_DELIVERY'] ?? ''),
+        'event'    => (string) ($_SERVER['HTTP_X_PAYMENTHOOKS_EVENT'] ?? ''),
+    ];
+
+    if (!Signature::verify($rawBody, $sigHeader, $config->webhookSecret)) {
+        $log->set(GatewayLog::BAD_SIGNATURE, $config->webhookSecret === ''
+            ? 'Webhook Signing Secret is not set in the module settings.'
+            : 'Signature did not match: the Webhook Signing Secret must be the whsec_ secret of this endpoint, '
+                . 'and the server clock must be within 5 minutes.', ['signatureHeader' => $sigHeader]);
+        $logger->error('webhook-signature', ['header' => $sigHeader], 'Signature verification failed', $secrets);
+        respond_webhook($log, $base, $secrets, 401, 'Invalid signature');
+    }
+
+    $event = json_decode($rawBody, true);
+    if (!is_array($event) || empty($event['id']) || empty($event['type'])) {
+        $log->set(GatewayLog::BAD_PAYLOAD, 'Signed body is not a PaymentHooks event envelope.', ['body' => substr($rawBody, 0, 500)]);
+        respond_webhook($log, $base, $secrets, 400, 'Invalid payload');
+    }
+
+    $eventId = (string) $event['id'];
+    $base = ['eventId' => $eventId, 'type' => (string) $event['type'], 'livemode' => !empty($event['livemode'])] + $base;
+
+    // Claim the event id (primary key). Retries of one event keep the same id.
+    // A finished event is acknowledged; a claim left by a delivery that died
+    // mid-way (timeout, fatal) is taken over after 10 minutes. Applying twice
+    // is still prevented: payments are checked by transaction id first.
+    try {
+        $claimed = claim_event($eventId, (string) $event['type'], $logger);
+    } catch (\Throwable $e) {
+        $log->set(GatewayLog::ERROR, 'Could not record the event (' . $e->getMessage() . '); PaymentHooks will redeliver it.');
+        $logger->error('webhook-claim', ['id' => $eventId], get_class($e) . ': ' . $e->getMessage(), $secrets);
+        respond_webhook($log, $base, $secrets, 500, 'Retry');
+    }
+    if (!$claimed) {
+        $log->set(GatewayLog::DUPLICATE, 'Event already processed (or being processed); acknowledged.');
+        respond_webhook($log, $base, $secrets, 200, 'Duplicate ignored');
+    }
+
+    try {
+        $handled = (new WebhookRouter($logger, $log))->dispatch($event);
+    } catch (\Throwable $e) {
+        $handled = false;
+        $log->set(GatewayLog::ERROR, get_class($e) . ': ' . $e->getMessage() . '. PaymentHooks will redeliver the event.');
+        $logger->error('webhook-dispatch', ['id' => $eventId, 'type' => $event['type']], get_class($e) . ': ' . $e->getMessage(), $secrets);
+    }
+
+    if (!$handled) {
+        // Release the claim so PaymentHooks' redelivery is processed.
+        Capsule::table('mod_paymenthooks_events')->where('event_id', $eventId)->delete();
+        respond_webhook($log, $base, $secrets, 500, 'Retry');
+    }
+
+    Capsule::table('mod_paymenthooks_events')->where('event_id', $eventId)->update(['status' => 'done']);
+    respond_webhook($log, $base, $secrets, 200, 'OK');
+}
+
+/** Writes the delivery's Gateway Log entry, then answers PaymentHooks. */
+function respond_webhook(GatewayLog $log, array $base, array $secrets, int $status, string $body): void
+{
+    try {
+        $log->write('paymenthooks', $base + ['httpStatus' => $status], $secrets);
+    } catch (\Throwable $e) {
+        // The response must still be sent; the failure itself is logged.
+        logActivity('PaymentHooks: could not write the Gateway Log entry: ' . $e->getMessage());
+    }
+    http_response_code($status);
+    die($body);
+}
+
+/**
+ * Claims an event for processing. False when it is already done or another
+ * delivery is processing it right now. Database errors other than a
+ * duplicate key are thrown (the caller answers 500, PaymentHooks redelivers).
+ */
+function claim_event(string $eventId, string $type, Logger $logger): bool
+{
+    $now = time();
+    try {
+        Capsule::table('mod_paymenthooks_events')->insert([
+            'event_id'    => $eventId,
+            'type'        => $type,
+            'status'      => 'processing',
+            'received_at' => $now,
+        ]);
+        return true;
+    } catch (\Illuminate\Database\QueryException $e) {
+        // SQLSTATE 23000 = integrity constraint (duplicate key).
+        if ((string) $e->getCode() !== '23000') {
+            throw $e;
+        }
+    }
+
+    // Take over a processing claim older than 10 minutes (the earlier
+    // delivery died). The conditional update lets only one taker win.
+    $taken = Capsule::table('mod_paymenthooks_events')
+        ->where('event_id', $eventId)
+        ->where('status', 'processing')
+        ->where('received_at', '<', $now - 600)
+        ->update(['received_at' => $now]);
+    if ($taken > 0) {
+        $logger->error('webhook-reclaim', ['id' => $eventId, 'type' => $type], 'Earlier delivery did not finish; reprocessing');
+        return true;
+    }
+    return false;
+}
+
+/* ----------------------------------------------------------------------- */
+
+/**
+ * The PH customer for this WHMCS client: created on first checkout, then
+ * found by exact email (PaymentHooks returns 409 DUPLICATE_EMAIL on create).
+ *
+ * @throws ApiException when it can be neither created nor found
+ */
+function resolve_customer_id(Client $client, int $userId): string
+{
+    $row = Capsule::table('tblclients')->where('id', $userId)->first();
+    $email = $row ? trim((string) $row->email) : '';
+    if ($email === '') {
+        throw new \RuntimeException('WHMCS client ' . $userId . ' has no email address.');
+    }
+
+    $name = trim($row->firstname . ' ' . $row->lastname);
+    $body = ['name' => $name !== '' ? $name : $email, 'email' => $email];
+    $country = strtoupper(trim((string) $row->country));
+    if ($country !== '' && strlen($country) <= 5) {
+        $body['country'] = $country;
+    }
+
+    try {
+        $resp = $client->post('/customers', $body);
+        $id = (string) ($resp['data']['id'] ?? '');
+        if ($id === '') {
+            throw new ApiException('PaymentHooks returned no customer id.', 'UNEXPECTED_RESPONSE');
+        }
+        return $id;
+    } catch (ApiException $e) {
+        if ($e->errorCode !== 'DUPLICATE_EMAIL') {
+            throw $e;
+        }
+    }
+
+    // `search` matches name or email by substring; take the exact email.
+    $list = $client->get('/customers', ['search' => $email, 'pageSize' => 100]);
+    foreach ($list['data'] ?? [] as $customer) {
+        if (strcasecmp((string) ($customer['email'] ?? ''), $email) === 0 && !empty($customer['id'])) {
+            return (string) $customer['id'];
+        }
+    }
+    throw new ApiException('PaymentHooks reported a duplicate email but the customer could not be found.', 'CUSTOMER_LOOKUP_FAILED');
+}
+
+function invoice_has_recurring_item(int $invoiceId): bool
+{
+    return PriceResolver::firstRecurringServiceId($invoiceId) > 0;
 }
 
 function redirect_to_invoice(int $invoiceId, string $flag): void

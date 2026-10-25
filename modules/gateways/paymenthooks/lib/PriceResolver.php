@@ -33,31 +33,30 @@ class PriceResolver
 
     /**
      * Returns a PH price id for the recurring service on this invoice, creating
-     * the PH product/price on first use. Returns '' if no recurring service is
-     * found or the mapping cannot be established.
+     * the PH product/price on first use.
      *
      * @param int    $invoiceId
      * @param string $currency   ISO code (e.g. INR)
-     * @return string PH price id, or '' on failure
+     * @return string PH price id
+     * @throws \RuntimeException when no subscription price can be established
      */
     public function resolveForInvoice(int $invoiceId, string $currency): string
     {
         $service = $this->firstRecurringService($invoiceId);
         if ($service === null) {
-            return '';
+            throw new \RuntimeException('Invoice ' . $invoiceId . ' has no recurring service to subscribe to.');
         }
 
         $cycle = strtolower((string) $service->billingcycle);
         $interval = self::cycleToInterval($cycle);
         if ($interval === null) {
-            // Not a cycle PH can express as a recurring interval.
-            return '';
+            throw new \RuntimeException('Billing cycle "' . $cycle . '" cannot be billed as a PaymentHooks subscription.');
         }
         $intervalCount = self::cycleToIntervalCount($cycle);
 
         $amountMinor = InvoiceMapper::toMinorUnits((float) $service->amount, $currency);
         if ($amountMinor <= 0) {
-            return '';
+            throw new \RuntimeException('Recurring amount for service ' . $service->id . ' is zero.');
         }
 
         $productId = (int) $service->packageid;
@@ -77,15 +76,9 @@ class PriceResolver
 
         // Create PH product (reuse if we already made one for this WHMCS product).
         $phProductId = $this->ensureProduct($productId);
-        if ($phProductId === '') {
-            return '';
-        }
 
         // Create the recurring price.
         $phPriceId = $this->createPrice($phProductId, $amountMinor, $currencyU, $interval, $intervalCount);
-        if ($phPriceId === '') {
-            return '';
-        }
 
         Capsule::table('mod_paymenthooks_price_map')->insert([
             'product_id'    => $productId,
@@ -160,22 +153,27 @@ class PriceResolver
         }
 
         try {
+            // /products does not honour Idempotency-Key; the price map caches
+            // the id so a product is created once per WHMCS product.
             $resp = $this->client->post('/products', [
                 'name'     => $name,
                 'type'     => 'service',
                 'metadata' => ['whmcs_product_id' => (string) $whmcsProductId],
-            ], 'prod-' . $whmcsProductId);
-            return (string) ($resp['data']['id'] ?? '');
+            ]);
         } catch (ApiException $e) {
             $this->logger->error('price-ensure-product', ['whmcsProductId' => $whmcsProductId], $e->getMessage());
-            return '';
+            throw new \RuntimeException('Could not create the PaymentHooks product: ' . $e->getMessage(), 0, $e);
         }
+        $id = (string) ($resp['data']['id'] ?? '');
+        if ($id === '') {
+            throw new \RuntimeException('PaymentHooks returned no product id.');
+        }
+        return $id;
     }
 
     private function createPrice(string $phProductId, int $amountMinor, string $currency, string $interval, int $intervalCount): string
     {
-        try {
-            $body = [
+        $body = [
                 'productId' => $phProductId,
                 'amount'    => $amountMinor,
                 'currency'  => $currency,
@@ -185,22 +183,22 @@ class PriceResolver
             if ($intervalCount > 1) {
                 $body['intervalCount'] = $intervalCount;
             }
-            $resp = $this->client->post('/prices', $body,
-                'price-' . $phProductId . '-' . $amountMinor . '-' . $interval . '-' . $intervalCount);
-            return (string) ($resp['data']['id'] ?? '');
+        try {
+            $resp = $this->client->post('/prices', $body);
         } catch (ApiException $e) {
             $this->logger->error('price-create', compact('phProductId', 'amountMinor', 'currency', 'interval', 'intervalCount'), $e->getMessage());
-            return '';
+            throw new \RuntimeException('Could not create the PaymentHooks price: ' . $e->getMessage(), 0, $e);
         }
+        $id = (string) ($resp['data']['id'] ?? '');
+        if ($id === '') {
+            throw new \RuntimeException('PaymentHooks returned no price id.');
+        }
+        return $id;
     }
 
     /**
-     * Maps a WHMCS billing cycle to a PH price interval (day/week/month/year).
-     * WHMCS cycles longer than a year are expressed via intervalCount, but PH's
-     * documented intervals are the four base units, so we fold multi-period
-     * cycles onto the closest base unit and rely on PH's intervalCount where the
-     * caller passes it. Here we return just the base unit; multi-year cycles
-     * (e.g. Biennially) map to 'year' and the amount already covers the period.
+     * Maps a WHMCS billing cycle to a PH price interval (day/week/month/year);
+     * multi-period cycles add intervalCount (see cycleToIntervalCount).
      */
     public static function cycleToInterval(string $cycle): ?string
     {

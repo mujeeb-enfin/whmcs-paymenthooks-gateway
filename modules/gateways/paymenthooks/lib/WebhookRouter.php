@@ -1,7 +1,16 @@
 <?php
 /**
- * Dispatches a verified PaymentHooks webhook event to the right handler and
- * applies the result to WHMCS invoices.
+ * Applies verified PaymentHooks webhook events to WHMCS.
+ *
+ * Handled events (subscribe the endpoint to these):
+ *   checkout.session.completed, checkout.session.payment_failed,
+ *   payment.refunded, subscription.renewed, subscription.renewal_failed,
+ *   subscription.cancelled
+ *
+ * dispatch() returns true when the event is fully handled (respond 200) and
+ * false when it must be redelivered (respond 500). An event that can never be
+ * applied (not ours, malformed) is acknowledged. Every outcome is recorded on
+ * the GatewayLog, which the callback writes to the WHMCS Gateway Log.
  */
 
 namespace PaymentHooks;
@@ -14,281 +23,186 @@ use WHMCS\Database\Capsule;
 
 class WebhookRouter
 {
+    const GATEWAY = 'paymenthooks';
+
     /** @var Logger */
     private $logger;
+    /** @var GatewayLog */
+    private $log;
     /** @var SubscriptionSync */
     private $subSync;
 
-    public function __construct(Logger $logger)
+    public function __construct(Logger $logger, GatewayLog $log)
     {
         $this->logger  = $logger;
-        $this->subSync = new SubscriptionSync($logger);
+        $this->log     = $log;
+        $this->subSync = new SubscriptionSync($logger, $log);
     }
 
-    /**
-     * @param array $event the decoded PH event envelope
-     * @return bool true if handled (respond 200), false to signal a retry
-     */
     public function dispatch(array $event): bool
     {
-        $type = $event['type'] ?? '';
-        $data = $event['data']['object'] ?? ($event['data'] ?? []);
-
+        $type = (string) ($event['type'] ?? '');
         switch ($type) {
             case 'checkout.session.completed':
-                return $this->onCheckoutCompleted($data);
-
+                return $this->onCheckoutCompleted($event);
             case 'checkout.session.payment_failed':
-                return $this->onCheckoutFailed($data);
-
+                return $this->onCheckoutFailed($event);
             case 'payment.refunded':
-            case 'charge.refunded':
-                return $this->onRefunded($data);
-
+                return $this->onRefunded($event);
             case 'subscription.renewed':
-            case 'invoice.paid':
-            case 'invoice.payment_succeeded':
-                return $this->onRenewalPaid($data);
-
+                return $this->onRenewed($event);
             case 'subscription.renewal_failed':
-            case 'invoice.payment_failed':
-                return $this->onRenewalFailed($data);
-
+                $sub = EventParser::subscription($event);
+                $this->subSync->handleRenewalFailed($sub['subscriptionId']);
+                return true;
             case 'subscription.cancelled':
-            case 'subscription.canceled':
-            case 'subscription.deleted':
-                return $this->onSubscriptionCancelled($data);
-
+                $sub = EventParser::subscription($event);
+                $this->subSync->handleCancelled($sub['subscriptionId']);
+                return true;
             default:
-                // Unhandled event types are acknowledged so PH stops retrying.
-                $this->logger->call('webhook-ignored', ['type' => $type], 'No handler; acknowledged');
+                $this->log->set(GatewayLog::IGNORED, 'No handler for ' . $type . '; acknowledged. '
+                    . 'Unsubscribe the endpoint from it in PaymentHooks if it is not needed.');
                 return true;
         }
     }
 
-    private function onCheckoutCompleted(array $data): bool
+    private function onCheckoutCompleted(array $event): bool
     {
-        $invoiceId = $this->resolveInvoiceId($data);
-        $paymentId = $data['paymentId'] ?? ($data['payment_id'] ?? ($data['id'] ?? ''));
-        $totalMinor = (int) ($data['amount'] ?? ($data['amountTotal'] ?? 0));
-        $currency  = strtoupper($data['currency'] ?? '');
+        $s = EventParser::checkoutCompleted($event);
 
-        // A completed checkout with no usable payment id cannot be reconciled.
-        // Return false so PH retries rather than silently dropping the payment.
-        if ($paymentId === '') {
-            $this->logger->error('webhook-completed-no-payid', $data, 'No payment id on completed session; requesting retry');
-            return false;
-        }
-        if ($invoiceId <= 0) {
-            $this->logger->error('webhook-completed-no-invoice', $data, 'Cannot map session to a WHMCS invoice; requesting retry');
-            return false;
-        }
-
-        if (function_exists('checkCbInvoiceID')) {
-            checkCbInvoiceID($invoiceId, 'paymenthooks');
-        }
-        // Already recorded? (Direct lookup — checkCbTransID die()s, so we can't
-        // branch on it.) A duplicate payment is a success, not a retry.
-        if (InvoiceMapper::transactionExists($paymentId)) {
+        if ($s['invoiceId'] <= 0) {
+            $this->log->set(GatewayLog::IGNORED, 'Checkout was not created by this WHMCS (no whmcs_invoice_id); acknowledged.', $s);
             return true;
         }
-
-        // PH may have collected a convenience fee on top of the invoice subtotal.
-        // The amount applied to the invoice must equal its balance (subtotal), so
-        // split the fee out and record it in WHMCS's fee column, not the amount.
-        $feeMinor = $this->resolveFeeMinor($data);
-        if ($feeMinor < 0 || $feeMinor > $totalMinor) {
-            $feeMinor = 0; // never trust a fee that exceeds the total
-        }
-        $appliedMinor = $totalMinor - $feeMinor;
-
-        $amount = InvoiceMapper::toMajorUnits($appliedMinor, $currency);
-        $fee    = InvoiceMapper::toMajorUnits($feeMinor, $currency);
-        if (function_exists('addInvoicePayment')) {
-            addInvoicePayment($invoiceId, $paymentId, $amount, $fee, 'paymenthooks');
+        if (!$s['paid'] || $s['paymentId'] === '' || $s['amountMinor'] <= 0 || $s['currency'] === '') {
+            return $this->attention('webhook-completed-malformed', $s, 'Completed checkout without payment id, amount or currency; apply it manually.');
         }
 
-        // Stamp only the session that produced this payment; capture the
-        // subscription id if the event carries one (recurring setup).
-        $subscriptionId = self::extractSubscriptionId($data);
-        $update = ['payment_id' => $paymentId, 'status' => 'completed', 'updated_at' => time()];
-        if ($subscriptionId !== '') {
-            $update['subscription_id'] = $subscriptionId;
+        $invoice = Capsule::table('tblinvoices')->where('id', $s['invoiceId'])->first();
+        if (!$invoice) {
+            return $this->attention('webhook-completed-no-invoice', $s, 'Invoice ' . $s['invoiceId'] . ' does not exist in WHMCS; payment ' . $s['paymentId'] . ' not applied.');
+        }
+        $invoiceCurrency = self::invoiceCurrency((int) $invoice->userid);
+        if ($invoiceCurrency !== $s['currency']) {
+            return $this->attention('webhook-completed-currency', $s + ['invoiceCurrency' => $invoiceCurrency],
+                'Payment ' . $s['paymentId'] . ' was in ' . $s['currency'] . ' but invoice ' . $s['invoiceId'] . ' is in ' . $invoiceCurrency . '; not applied, record it manually.');
         }
 
-        $sessionId = $data['sessionId'] ?? ($data['id'] ?? '');
-        $q = Capsule::table('mod_paymenthooks_sessions')->where('invoice_id', $invoiceId);
-        if ($sessionId !== '') {
-            $q->where('session_id', $sessionId);
+        $feeMinor = $this->sessionFeeMinor($s['sessionId']);
+        if ($feeMinor < 0 || $feeMinor >= $s['amountMinor']) {
+            $feeMinor = 0;
         }
-        $q->update($update);
+        $applied = $s + ['convenienceFee' => InvoiceMapper::toMajorUnits($feeMinor, $s['currency'])];
 
-        // Record the PH subscription id on the WHMCS service(s) so WHMCS's
-        // "Cancel" action (paymenthooks_cancelSubscription) can reach PH, and so
-        // renewal webhooks can map back to a service.
-        if ($subscriptionId !== '') {
-            $this->bindSubscriptionToServices($invoiceId, $subscriptionId);
+        if (InvoiceMapper::transactionExists($s['paymentId'], self::GATEWAY)) {
+            $this->log->set(GatewayLog::DUPLICATE, 'Payment ' . $s['paymentId'] . ' is already recorded on invoice ' . $s['invoiceId'] . '.', $applied);
+        } else {
+            // The convenience fee was paid by the client on top of the balance.
+            // Credit the invoice with the balance part only; WHMCS's fee argument
+            // means a gateway cost to the merchant, so it is not used.
+            $amount = InvoiceMapper::toMajorUnits($s['amountMinor'] - $feeMinor, $s['currency']);
+            addInvoicePayment($s['invoiceId'], $s['paymentId'], $amount, 0, self::GATEWAY);
+            $this->log->set(GatewayLog::SUCCESSFUL, 'Applied ' . $amount . ' ' . $s['currency'] . ' to invoice ' . $s['invoiceId'] . '.', $applied);
         }
 
+        $update = ['payment_id' => $s['paymentId'], 'status' => 'completed', 'updated_at' => time()];
+        if ($s['subscriptionId'] !== '') {
+            $update['subscription_id'] = $s['subscriptionId'];
+        }
+        Capsule::table('mod_paymenthooks_sessions')
+            ->where('invoice_id', $s['invoiceId'])
+            ->where('session_id', $s['sessionId'])
+            ->update($update);
+
+        if ($s['subscriptionId'] !== '') {
+            $this->bindSubscriptionToService($s['invoiceId'], $s['subscriptionId']);
+        }
         return true;
     }
 
     /**
-     * Writes the PH subscription id onto the ONE recurring service the
-     * subscription was created for (PriceResolver bills the first recurring
-     * service and sends a single priceId). Binding every service on the invoice
-     * would falsely mark co-invoiced one-time/other services as subscribed and
-     * misroute later renewal webhooks. WHMCS passes this value to
-     * paymenthooks_cancelSubscription($params['subscriptionID']).
+     * Stores the PH subscription id on the one recurring service it was created
+     * for (PriceResolver priced the first recurring service). WHMCS passes it
+     * back to paymenthooks_cancelSubscription() as $params['subscriptionID'].
      */
-    private function bindSubscriptionToServices(int $invoiceId, string $subscriptionId): void
+    private function bindSubscriptionToService(int $invoiceId, string $subscriptionId): void
     {
         $serviceId = PriceResolver::firstRecurringServiceId($invoiceId);
         if ($serviceId <= 0) {
+            $this->logger->error('webhook-subscription-unbound', ['invoiceId' => $invoiceId, 'subscriptionId' => $subscriptionId],
+                'No recurring service on invoice ' . $invoiceId . ' to bind subscription ' . $subscriptionId . ' to; renewals will not be recorded.');
             return;
         }
-        Capsule::table('tblhosting')
-            ->where('id', $serviceId)
-            ->update(['subscriptionid' => $subscriptionId]);
+        Capsule::table('tblhosting')->where('id', $serviceId)->update(['subscriptionid' => $subscriptionId]);
     }
 
-    private function onCheckoutFailed(array $data): bool
+    private function onCheckoutFailed(array $event): bool
     {
-        $invoiceId = $this->resolveInvoiceId($data);
-        if ($invoiceId > 0 && function_exists('logActivity')) {
-            logActivity('PaymentHooks: payment failed for invoice ' . $invoiceId);
-        }
-        $this->logger->call('webhook-payment-failed', $data, 'Logged');
-        return true;
-    }
-
-    private function onRefunded(array $data): bool
-    {
-        $paymentId = $data['paymentId'] ?? ($data['id'] ?? '');
-        if (function_exists('logTransaction')) {
-            logTransaction('paymenthooks', $data, 'Refund (' . $paymentId . ')');
-        }
-        return true;
-    }
-
-    private function onRenewalPaid(array $data): bool
-    {
-        $subscriptionId = self::extractSubscriptionId($data);
-        $paymentId = $data['paymentId'] ?? ($data['payment_id'] ?? ($data['id'] ?? ''));
-        $totalMinor = (int) ($data['amount'] ?? ($data['amountTotal'] ?? ($data['amountPaid'] ?? 0)));
-        $currency = strtoupper($data['currency'] ?? '');
-
-        if ($subscriptionId === '' || $paymentId === '') {
-            // Not enough to reconcile; acknowledge to avoid infinite retries.
-            $this->logger->error('webhook-renewal-bad', $data, 'Missing subscription or payment id');
+        $o = EventParser::object($event);
+        $invoiceId = EventParser::invoiceId($o);
+        $data = ['sessionId' => (string) ($o['id'] ?? ''), 'invoiceId' => $invoiceId];
+        if ($invoiceId <= 0) {
+            $this->log->set(GatewayLog::IGNORED, 'Failed checkout was not created by this WHMCS; acknowledged.', $data);
             return true;
         }
-
-        // Split any convenience fee out of the charged total, same as one-time:
-        // the invoice payment must equal the invoice balance (net), with the fee
-        // recorded separately rather than inflating the amount.
-        $feeMinor = $this->resolveFeeMinor($data);
-        if ($feeMinor < 0 || $feeMinor > $totalMinor) {
-            $feeMinor = 0;
-        }
-        $netMinor = $totalMinor - $feeMinor;
-
-        $this->subSync->handleRenewalPaid($subscriptionId, $paymentId, $netMinor, $currency, $feeMinor);
-        return true;
-    }
-
-    private function onRenewalFailed(array $data): bool
-    {
-        $subscriptionId = self::extractSubscriptionId($data);
-        $retryUrl = $data['retryUrl'] ?? ($data['hostedUrl'] ?? null);
-        if ($subscriptionId !== '') {
-            $this->subSync->handleRenewalFailed($subscriptionId, $retryUrl);
-        }
-        return true;
-    }
-
-    private function onSubscriptionCancelled(array $data): bool
-    {
-        // For subscription.* events the object's own id IS the subscription id.
-        $subscriptionId = self::scalarId($data['id'] ?? null);
-        if ($subscriptionId === '') {
-            $subscriptionId = self::extractSubscriptionId($data);
-        }
-        if ($subscriptionId !== '') {
-            $this->subSync->handleCancelled($subscriptionId);
-        }
+        $this->log->set(GatewayLog::FAILURE, 'Payment attempt failed for invoice ' . $invoiceId . '; the invoice stays unpaid.', $data);
         return true;
     }
 
     /**
-     * Reads the PH subscription id from an event payload, tolerating the field
-     * spellings PH may use and ignoring non-scalar values (e.g. if PH nests the
-     * subscription as an object rather than an id string).
-     *
-     * Public static so it can be unit-tested without WHMCS.
+     * Refunds issued from WHMCS are recorded by WHMCS when paymenthooks_refund()
+     * returns. A refund made in the PaymentHooks dashboard is logged here for
+     * the admin to reflect in WHMCS.
      */
-    public static function extractSubscriptionId(array $data): string
+    private function onRefunded(array $event): bool
     {
-        foreach (['subscriptionId', 'subscription_id', 'subscription'] as $k) {
-            if (isset($data[$k])) {
-                $id = self::scalarId($data[$k]);
-                if ($id !== '') {
-                    return $id;
-                }
-                // Nested object form: {"subscription": {"id": "sub_..."}}
-                if (is_array($data[$k]) && isset($data[$k]['id'])) {
-                    $nested = self::scalarId($data[$k]['id']);
-                    if ($nested !== '') {
-                        return $nested;
-                    }
-                }
-            }
+        $r = EventParser::paymentRefunded($event);
+        if ($r['paymentId'] === '' || !InvoiceMapper::transactionExists($r['paymentId'], self::GATEWAY)) {
+            $this->log->set(GatewayLog::IGNORED, 'Refunded payment is not recorded in this WHMCS; acknowledged.', $r);
+            return true;
         }
-        return '';
+        $this->log->set(GatewayLog::REFUND, 'PaymentHooks reports ' . InvoiceMapper::toMajorUnits($r['amountRefundedMinor'], $r['currency'])
+            . ' ' . $r['currency'] . ' refunded on payment ' . $r['paymentId'] . '. Refunds made in WHMCS are already recorded; '
+            . 'one made in the PaymentHooks dashboard must be added to the invoice manually.', $r);
+        return true;
     }
 
-    /** Returns a trimmed string only for scalar input; '' for arrays/objects/null. */
-    public static function scalarId($v): string
+    private function onRenewed(array $event): bool
     {
-        return is_scalar($v) ? trim((string) $v) : '';
+        $sub = EventParser::subscription($event);
+        if ($sub['subscriptionId'] === '') {
+            return $this->attention('webhook-renewal-malformed', $sub, 'Renewal without a subscription id; acknowledged.');
+        }
+        if ($sub['paymentId'] === '') {
+            $this->log->set(GatewayLog::IGNORED, 'Renewal fully covered by credit; nothing was charged.', $sub);
+            return true;
+        }
+        return $this->subSync->handleRenewalPaid($sub['subscriptionId'], $sub['paymentId'], $sub['amountMinor'], $sub['currency']);
     }
 
-    /**
-     * Extracts the convenience fee (minor units) from a completed-session event,
-     * tolerating the field spellings PH may use. 0 if none present.
-     */
-    private function resolveFeeMinor(array $data): int
+    /** Acknowledges an event that cannot be applied automatically, loudly. */
+    private function attention(string $action, array $data, string $note): bool
     {
-        foreach (['convenienceFee', 'convenience_fee', 'feeAmount', 'fee'] as $k) {
-            if (isset($data[$k]) && is_numeric($data[$k])) {
-                return (int) $data[$k];
-            }
-        }
-        return 0;
+        $this->logger->error($action, $data, $note);
+        $this->log->set(GatewayLog::NEEDS_ATTENTION, $note, $data);
+        return true;
     }
 
-    /**
-     * Pulls the WHMCS invoice id from the event: metadata first (we set it at
-     * session create), then our local sessions table keyed by session id.
-     */
-    private function resolveInvoiceId(array $data): int
+    private function sessionFeeMinor(string $sessionId): int
     {
-        $meta = $data['metadata'] ?? [];
-        if (isset($meta['whmcs_invoice_id']) && (int) $meta['whmcs_invoice_id'] > 0) {
-            return (int) $meta['whmcs_invoice_id'];
+        if ($sessionId === '') {
+            return 0;
         }
+        return (int) Capsule::table('mod_paymenthooks_sessions')->where('session_id', $sessionId)->value('fee_minor');
+    }
 
-        $sessionId = $data['sessionId'] ?? ($data['id'] ?? '');
-        if ($sessionId !== '') {
-            $row = Capsule::table('mod_paymenthooks_sessions')
-                ->where('session_id', $sessionId)
-                ->orderBy('id', 'desc')
-                ->first();
-            if ($row) {
-                return (int) $row->invoice_id;
-            }
-        }
-
-        return 0;
+    /** ISO code of the client's currency; '' if unknown. */
+    public static function invoiceCurrency(int $clientId): string
+    {
+        $code = Capsule::table('tblclients')
+            ->join('tblcurrencies', 'tblcurrencies.id', '=', 'tblclients.currency')
+            ->where('tblclients.id', $clientId)
+            ->value('tblcurrencies.code');
+        return $code ? strtoupper((string) $code) : '';
     }
 }
