@@ -1,0 +1,94 @@
+{
+  "id": "evt_whmcs_completed_sub",
+  "object": "event",
+  "api_version": "2026-04-22",
+  "created": 1767225600,
+  "type": "checkout.session.completed",
+  "livemode": false,
+  "data": {
+    "object": {
+      "id": "cs_whmcs_2",
+      "object": "checkout.session",
+      "payment_status": "paid",
+      "status": "complete",
+      "amount_total": 49900,
+      "amount_subtotal": 49900,
+      "currency": "inr",
+      "mode": "subscription",
+      "customer": null,
+      "customer_email": null,
+      "customer_details": {
+        "email": null,
+        "name": null,
+        "phone": null,
+        "tax_exempt": "none",
+        "tax_ids": [],
+        "address": null
+      },
+      "payment_intent": "ph_pay_whmcs_2",
+      "subscription": "ph_sub_whmcs_1",
+      "success_url": null,
+      "cancel_url": null,
+      "url": "https://paymenthooks.com/checkout/cs_whmcs_2",
+      "line_items": {
+        "object": "list",
+        "data": []
+      },
+      "payment_method_types": [
+        "card"
+      ],
+      "metadata": {
+        "whmcs_invoice_id": "1002",
+        "priceId": "ph_pri_1"
+      },
+      "created": 1767225600,
+      "expires_at": 1767312000,
+      "livemode": false,
+      "after_expiration": null,
+      "allow_promotion_codes": false,
+      "amount_subtotal_excluding_tax": 49900,
+      "amount_total_excluding_tax": 49900,
+      "automatic_tax": null,
+      "billing_address_collection": "auto",
+      "cancel_at": null,
+      "client_reference_id": null,
+      "client_secret": null,
+      "consent": null,
+      "consent_collection": null,
+      "currency_conversion": null,
+      "custom_fields": null,
+      "custom_text": null,
+      "customer_creation": "always",
+      "default_tax_rates": null,
+      "invoice_creation": null,
+      "invoice": null,
+      "locale": null,
+      "payment_intent_data": null,
+      "payment_link": null,
+      "payment_method_collection": "always",
+      "payment_method_configuration_details": null,
+      "payment_method_options": null,
+      "phone_number_collection": null,
+      "recovered_from": null,
+      "setup_intent": null,
+      "shipping_address_collection": null,
+      "shipping_cost": null,
+      "shipping_details": null,
+      "shipping_options": null,
+      "status_transitions": null,
+      "submit_type": null,
+      "subscription_data": null,
+      "tax_id_collection": null,
+      "total_details": {
+        "amount_discount": 0,
+        "amount_shipping": 0,
+        "amount_tax": 0
+      },
+      "ui_mode": "hosted"
+    }
+  },
+  "request": {
+    "id": null,
+    "idempotency_key": null
+  }
+}

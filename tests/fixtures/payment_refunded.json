@@ -1,0 +1,120 @@
+{
+  "id": "evt_whmcs_refunded",
+  "object": "event",
+  "api_version": "2026-04-22",
+  "created": 1767225600,
+  "type": "payment.refunded",
+  "livemode": false,
+  "data": {
+    "object": {
+      "id": "ph_pay_whmcs_1",
+      "object": "payment_intent",
+      "amount": 102000,
+      "amount_capturable": 0,
+      "amount_received": 102000,
+      "amount_details": null,
+      "application_fee_amount": null,
+      "currency": "inr",
+      "customer": null,
+      "description": null,
+      "status": "succeeded",
+      "payment_method_configuration_details": null,
+      "payment_method_options": null,
+      "payment_method_types": [
+        "card"
+      ],
+      "latest_charge": "ch_ph_pay_whmcs_1",
+      "charges": {
+        "object": "list",
+        "data": [
+          {
+            "id": "ch_ph_pay_whmcs_1",
+            "object": "charge",
+            "amount": 102000,
+            "amount_captured": 102000,
+            "amount_refunded": 50000,
+            "currency": "inr",
+            "status": "succeeded",
+            "paid": true,
+            "refunded": true,
+            "payment_intent": "ph_pay_whmcs_1",
+            "customer": null,
+            "description": null,
+            "metadata": {
+              "whmcs_invoice_id": "1001"
+            },
+            "created": 1767225600,
+            "livemode": false,
+            "application": null,
+            "application_fee_amount": null,
+            "balance_transaction": null,
+            "billing_details": null,
+            "calculated_statement_descriptor": null,
+            "captured": true,
+            "destination": null,
+            "dispute": null,
+            "disputed": false,
+            "failure_balance_transaction": null,
+            "failure_code": null,
+            "failure_message": null,
+            "fraud_details": null,
+            "invoice": null,
+            "on_behalf_of": null,
+            "outcome": null,
+            "payment_method": null,
+            "payment_method_details": null,
+            "receipt_email": null,
+            "receipt_number": null,
+            "receipt_url": null,
+            "review": null,
+            "refunds": {
+              "object": "list",
+              "data": [],
+              "has_more": false,
+              "total_count": 1,
+              "url": "/v1/charges/ch_ph_pay_whmcs_1/refunds"
+            },
+            "shipping": null,
+            "source": null,
+            "source_transfer": null,
+            "statement_descriptor": null,
+            "statement_descriptor_suffix": null,
+            "transfer": null,
+            "transfer_data": null,
+            "transfer_group": null
+          }
+        ]
+      },
+      "receipt_email": null,
+      "metadata": {
+        "whmcs_invoice_id": "1001"
+      },
+      "created": 1767225600,
+      "livemode": false,
+      "statement_descriptor": null,
+      "statement_descriptor_suffix": null,
+      "canceled_at": null,
+      "cancellation_reason": null,
+      "last_payment_error": null,
+      "next_action": null,
+      "client_secret": null,
+      "setup_future_usage": null,
+      "capture_method": "automatic",
+      "confirmation_method": "automatic",
+      "shipping": null,
+      "application": null,
+      "on_behalf_of": null,
+      "transfer_data": null,
+      "transfer_group": null,
+      "invoice": null,
+      "processing": null,
+      "review": null,
+      "source": null,
+      "automatic_payment_methods": null
+    }
+  },
+  "request": {
+    "id": null,
+    "idempotency_key": null
+  }
+}

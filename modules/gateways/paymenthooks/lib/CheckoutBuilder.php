@@ -96,6 +96,35 @@ class CheckoutBuilder
         return 'whmcs-' . $installId . '-inv-' . $invoiceId . '-' . $subtotalMinor . '-' . $mode . '-' . $attemptSeq;
     }
 
+    /**
+     * POST /customers body for a WHMCS client. Everything WHMCS knows about
+     * the client is sent, so the hosted checkout prefills it and does not ask
+     * the client again (name, phone; email is also sent per session).
+     *
+     * @param array{email?: string, firstname?: string, lastname?: string, companyname?: string, phonenumber?: string, country?: string} $client tblclients row
+     */
+    public static function customerBody(array $client): array
+    {
+        $email = trim((string) ($client['email'] ?? ''));
+        if ($email === '') {
+            throw new \InvalidArgumentException('The WHMCS client has no email address.');
+        }
+        $name = trim(trim((string) ($client['firstname'] ?? '')) . ' ' . trim((string) ($client['lastname'] ?? '')));
+        if ($name === '') {
+            $name = trim((string) ($client['companyname'] ?? ''));
+        }
+        $body = ['name' => $name !== '' ? $name : $email, 'email' => $email];
+        $phone = trim((string) ($client['phonenumber'] ?? ''));
+        if ($phone !== '' && strlen($phone) <= 50) {
+            $body['phone'] = $phone;
+        }
+        $country = strtoupper(trim((string) ($client['country'] ?? '')));
+        if ($country !== '' && strlen($country) <= 5) {
+            $body['country'] = $country;
+        }
+        return $body;
+    }
+
     public static function convenienceFeeMinor(Config $config, int $subtotalMinor): int
     {
         if ($config->convenienceFeePercent === null || $config->convenienceFeePercent <= 0) {

@@ -44,6 +44,11 @@ class Client
         return $this->request('POST', $path, $body, $idempotencyKey);
     }
 
+    public function put(string $path, array $body): array
+    {
+        return $this->request('PUT', $path, $body, null);
+    }
+
     /**
      * @throws ApiException on transport failure or a non-2xx response
      */

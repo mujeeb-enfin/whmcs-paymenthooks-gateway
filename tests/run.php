@@ -1,146 +1,230 @@
 <?php
-
 /**
- * Standalone tests for the pure, WHMCS-independent logic:
- *   - Signature verification (HMAC, replay window, rotation)
- *   - Minor-unit conversion (normal + zero-decimal currencies)
- *   - Billing-cycle -> PH interval / intervalCount mapping
- *   - Custom-domain normalisation and checkout-mode policy
+ * Standalone tests for the module's pure logic. No WHMCS, network or database.
  *
- * Run:  php tests/run.php
- * No WHMCS, no network. Exits non-zero on any failure.
+ *   php tests/run.php
+ *
+ * Webhook fixtures in tests/fixtures are generated from the PaymentHooks
+ * payload builders (src/services/webhooks/whmcs-fixtures.test.ts in the
+ * PaymentHooks repo), so these tests parse the exact live event shapes.
  */
 
-define('WHMCS', true); // let the guarded library files load
+define('WHMCS', true);
 
-require __DIR__ . '/../modules/gateways/paymenthooks/lib/Signature.php';
-require __DIR__ . '/../modules/gateways/paymenthooks/lib/InvoiceMapper.php';
-require __DIR__ . '/../modules/gateways/paymenthooks/lib/PriceResolver.php';
-require __DIR__ . '/../modules/gateways/paymenthooks/lib/Config.php';
-require __DIR__ . '/../modules/gateways/paymenthooks/lib/Logger.php';
-require __DIR__ . '/../modules/gateways/paymenthooks/lib/SubscriptionSync.php';
-require __DIR__ . '/../modules/gateways/paymenthooks/lib/WebhookRouter.php';
+$lib = __DIR__ . '/../modules/gateways/paymenthooks/lib/';
+require_once $lib . 'Config.php';
+require_once $lib . 'Logger.php';
+require_once $lib . 'Client.php';
+require_once $lib . 'Signature.php';
+require_once $lib . 'EventParser.php';
+require_once $lib . 'CheckoutBuilder.php';
+require_once $lib . 'PriceResolver.php';
 
-use PaymentHooks\Signature;
+// InvoiceMapper and WebhookRouter reference Capsule only in DB methods, which
+// these tests never call.
+if (!class_exists('WHMCS\\Database\\Capsule')) {
+    eval('namespace WHMCS\\Database; class Capsule {}');
+}
+require_once $lib . 'InvoiceMapper.php';
+
+use PaymentHooks\CheckoutBuilder;
+use PaymentHooks\Client;
+use PaymentHooks\Config;
+use PaymentHooks\ConfigException;
+use PaymentHooks\EventParser;
 use PaymentHooks\InvoiceMapper;
 use PaymentHooks\PriceResolver;
-use PaymentHooks\Config;
-use PaymentHooks\WebhookRouter;
+use PaymentHooks\Signature;
 
-$pass = 0;
-$fail = 0;
-function check(string $label, $got, $want): void
+$failures = 0;
+$count = 0;
+
+function check(string $name, bool $ok, string $detail = ''): void
 {
-    global $pass, $fail;
-    $ok = $got === $want;
+    global $failures, $count;
+    $count++;
     if ($ok) {
-        $pass++;
-        echo "  PASS  $label\n";
-    } else {
-        $fail++;
-        echo "  FAIL  $label\n        got:  " . var_export($got, true) . "\n        want: " . var_export($want, true) . "\n";
+        echo "  ok   {$name}\n";
+        return;
+    }
+    $failures++;
+    echo "  FAIL {$name}" . ($detail !== '' ? " -- {$detail}" : '') . "\n";
+}
+
+function same(string $name, $expected, $actual): void
+{
+    check($name, $expected === $actual, 'expected ' . var_export($expected, true) . ', got ' . var_export($actual, true));
+}
+
+function throws(string $name, callable $fn, string $class): void
+{
+    try {
+        $fn();
+        check($name, false, "no {$class} thrown");
+    } catch (\Throwable $e) {
+        check($name, $e instanceof $class, 'threw ' . get_class($e) . ': ' . $e->getMessage());
     }
 }
-function check_true(string $label, bool $got): void
+
+function fixture(string $name): array
 {
-    check($label, $got, true);
+    $path = __DIR__ . '/fixtures/' . $name . '.json';
+    $data = json_decode((string) file_get_contents($path), true);
+    if (!is_array($data)) {
+        fwrite(STDERR, "Missing or invalid fixture {$path}\n");
+        exit(2);
+    }
+    return $data;
 }
-function check_false(string $label, bool $got): void
+
+function config(array $overrides = []): Config
 {
-    check($label, $got, false);
-}
-
-/* ---- Signature ------------------------------------------------------- */
-echo "Signature:\n";
-$secret = 'whsec_test_123';
-$body = '{"id":"evt_1","type":"checkout.session.completed"}';
-$t = time();
-$good = hash_hmac('sha256', $t . '.' . $body, $secret);
-check_true(
-    'valid signature accepted',
-    Signature::verify($body, "t={$t},v1={$good}", $secret)
-);
-check_false(
-    'tampered body rejected',
-    Signature::verify($body . 'x', "t={$t},v1={$good}", $secret)
-);
-check_false(
-    'wrong secret rejected',
-    Signature::verify($body, "t={$t},v1={$good}", 'other')
-);
-$old = $t - 10000;
-$oldSig = hash_hmac('sha256', $old . '.' . $body, $secret);
-check_false(
-    'stale timestamp rejected (replay window)',
-    Signature::verify($body, "t={$old},v1={$oldSig}", $secret)
-);
-check_true(
-    'rotation: previous-secret signature accepted via v1_previous',
-    Signature::verify($body, "t={$t},v1=deadbeef,v1_previous={$good}", $secret)
-);
-check_false('empty secret rejected', Signature::verify($body, "t={$t},v1={$good}", ''));
-check_false('missing t rejected', Signature::verify($body, "v1={$good}", $secret));
-
-/* ---- Minor units ----------------------------------------------------- */
-echo "InvoiceMapper minor units:\n";
-check('INR 499.00 -> 49900', InvoiceMapper::toMinorUnits(499.00, 'INR'), 49900);
-check('USD 29.90 -> 2990', InvoiceMapper::toMinorUnits(29.90, 'USD'), 2990);
-check('JPY 500 -> 500 (zero-decimal)', InvoiceMapper::toMinorUnits(500.0, 'JPY'), 500);
-check('rounding 10.005 -> 1001', InvoiceMapper::toMinorUnits(10.005, 'USD'), 1001);
-check('back: 49900 INR -> 499.0', InvoiceMapper::toMajorUnits(49900, 'INR'), 499.0);
-check('back: 500 JPY -> 500.0', InvoiceMapper::toMajorUnits(500, 'JPY'), 500.0);
-
-/* ---- Cycle mapping --------------------------------------------------- */
-echo "PriceResolver cycle mapping:\n";
-check('monthly -> month', PriceResolver::cycleToInterval('Monthly'), 'month');
-check('annually -> year', PriceResolver::cycleToInterval('Annually'), 'year');
-check('quarterly -> month', PriceResolver::cycleToInterval('Quarterly'), 'month');
-check('weekly -> week', PriceResolver::cycleToInterval('Weekly'), 'week');
-check('one time -> null', PriceResolver::cycleToInterval('One Time'), null);
-check('quarterly count 3', PriceResolver::cycleToIntervalCount('Quarterly'), 3);
-check('semi-annually count 6', PriceResolver::cycleToIntervalCount('Semi-Annually'), 6);
-check('biennially count 2', PriceResolver::cycleToIntervalCount('Biennially'), 2);
-check('monthly count 1', PriceResolver::cycleToIntervalCount('Monthly'), 1);
-
-/* ---- Domain normalisation ------------------------------------------- */
-echo "Config host normalisation:\n";
-check('blank -> default', Config::normaliseHost(''), Config::DEFAULT_HOST);
-check('strip https + slash', Config::normaliseHost('https://payments.mr-innovations.com/'), 'payments.mr-innovations.com');
-check('strip http + path', Config::normaliseHost('http://payments.mr-innovations.com/api/v1'), 'payments.mr-innovations.com');
-check('strip port', Config::normaliseHost('payments.mr-innovations.com:8443'), 'payments.mr-innovations.com');
-check('lowercase', Config::normaliseHost('Payments.MR-Innovations.COM'), 'payments.mr-innovations.com');
-
-/* ---- Checkout-mode policy ------------------------------------------- */
-echo "Config checkout-mode policy:\n";
-function cfg(string $policy, bool $subsEnabled): Config
-{
-    return Config::fromParams([
-        'mode'                => 'test',
-        'paymentModePolicy'   => $policy,
-        'enableSubscriptions' => $subsEnabled ? 'on' : '',
+    return Config::fromParams($overrides + [
+        'secretKey'     => 'phk_live_' . str_repeat('a', 64),
+        'webhookSecret' => 'whsec_' . str_repeat('b', 32),
     ]);
 }
-check('auto + recurring + enabled -> subscription', cfg('auto', true)->resolveCheckoutMode(true), 'subscription');
-check('auto + recurring + disabled -> payment', cfg('auto', false)->resolveCheckoutMode(true), 'payment');
-check('auto + one-time -> payment', cfg('auto', true)->resolveCheckoutMode(false), 'payment');
-check('force subscription + enabled -> subscription', cfg('subscription', true)->resolveCheckoutMode(false), 'subscription');
-check('force subscription + disabled -> payment (safe fallback)', cfg('subscription', false)->resolveCheckoutMode(true), 'payment');
-check('force payment + recurring -> payment', cfg('payment', true)->resolveCheckoutMode(true), 'payment');
-check('unknown policy -> auto behaviour', cfg('garbage', true)->resolveCheckoutMode(true), 'subscription');
 
-/* ---- Subscription id extraction ------------------------------------- */
-echo "WebhookRouter subscription-id extraction:\n";
-check('scalar string', WebhookRouter::scalarId('sub_1'), 'sub_1');
-check('scalar int', WebhookRouter::scalarId(42), '42');
-check('array -> empty', WebhookRouter::scalarId(['id' => 'x']), '');
-check('null -> empty', WebhookRouter::scalarId(null), '');
-check('camelCase field', WebhookRouter::extractSubscriptionId(['subscriptionId' => 'sub_a']), 'sub_a');
-check('snake_case field', WebhookRouter::extractSubscriptionId(['subscription_id' => 'sub_b']), 'sub_b');
-check('bare subscription string', WebhookRouter::extractSubscriptionId(['subscription' => 'sub_c']), 'sub_c');
-check('nested subscription object', WebhookRouter::extractSubscriptionId(['subscription' => ['id' => 'sub_d']]), 'sub_d');
-check('none present -> empty', WebhookRouter::extractSubscriptionId(['foo' => 'bar']), '');
-check('precedence: camel over nested', WebhookRouter::extractSubscriptionId(['subscriptionId' => 'sub_x', 'subscription' => ['id' => 'sub_y']]), 'sub_x');
+echo "Signature\n";
+$secret = 'whsec_test_secret';
+$body = '{"id":"evt_1","type":"checkout.session.completed"}';
+$t = (string) time();
+$sig = hash_hmac('sha256', $t . '.' . $body, $secret);
+check('valid v1', Signature::verify($body, "t={$t},v1={$sig}", $secret));
+check('valid v1_previous during rotation', Signature::verify($body, "t={$t},v1=deadbeef,v1_previous={$sig}", $secret));
+check('tampered body rejected', !Signature::verify($body . ' ', "t={$t},v1={$sig}", $secret));
+$old = (string) (time() - 301);
+check('stale timestamp rejected', !Signature::verify($body, "t={$old},v1=" . hash_hmac('sha256', $old . '.' . $body, $secret), $secret));
+check('empty secret rejected', !Signature::verify($body, "t={$t},v1={$sig}", ''));
+check('missing t rejected', !Signature::verify($body, "v1={$sig}", $secret));
 
-/* ---- Summary --------------------------------------------------------- */
-echo "\n" . ($fail === 0 ? "ALL PASS" : "FAILURES") . ": {$pass} passed, {$fail} failed\n";
-exit($fail === 0 ? 0 : 1);
+echo "Config\n";
+same('valid config has no problems', [], config()->validate());
+check('old sk_live_ key rejected', count(config(['secretKey' => 'sk_live_abc'])->validate()) === 1);
+check('missing webhook secret reported', count(config(['webhookSecret' => ''])->validate()) === 1);
+check('bad publishable key reported', count(config(['publishableKey' => 'pk_live_x'])->validate()) === 1);
+check('fee over 100% reported', count(config(['convenienceFeePercent' => '150'])->validate()) === 1);
+same('API base is fixed', 'https://paymenthooks.com/api/v1', config(['customDomain' => 'pay.example.com'])->baseUrl);
+same('host normalised', 'pay.example.com', Config::normaliseHost(' HTTPS://Pay.Example.com:443/checkout/ '));
+same('own host means none', '', Config::normaliseHost('https://paymenthooks.com'));
+same('checkout URL moves to custom domain', 'https://pay.example.com/checkout/cs_1',
+    config(['customDomain' => 'pay.example.com'])->checkoutUrl('https://paymenthooks.com/checkout/cs_1'));
+same('checkout URL unchanged without custom domain', 'https://paymenthooks.com/checkout/cs_1',
+    config()->checkoutUrl('https://paymenthooks.com/checkout/cs_1'));
+same('yesno "on" enables subscriptions', true, config(['enableSubscriptions' => 'on'])->subscriptionsEnabled);
+same('auto + recurring + enabled = subscription', 'subscription', config(['enableSubscriptions' => 'on'])->resolveCheckoutMode(true));
+same('auto + one-time = payment', 'payment', config(['enableSubscriptions' => 'on'])->resolveCheckoutMode(false));
+same('auto + recurring + disabled = payment', 'payment', config()->resolveCheckoutMode(true));
+same('payment policy ignores recurring', 'payment', config(['enableSubscriptions' => 'on', 'paymentModePolicy' => 'payment'])->resolveCheckoutMode(true));
+throws('subscription policy without the feature fails', function () {
+    config(['paymentModePolicy' => 'subscription'])->resolveCheckoutMode(true);
+}, ConfigException::class);
+same('idempotency key sanitised', 'inv-1-a-b', Client::idempotencyKey('inv-1 a/b'));
+same('idempotency key capped at PaymentHooks limit of 200', 200, strlen(Client::idempotencyKey(str_repeat('k', 300))));
+
+echo "Minor units\n";
+same('INR 499.00', 49900, InvoiceMapper::toMinorUnits(499.00, 'INR'));
+same('USD 0.1 + 0.2 rounds', 30, InvoiceMapper::toMinorUnits(0.1 + 0.2, 'usd'));
+same('JPY has no minor unit', 1500, InvoiceMapper::toMinorUnits(1500, 'JPY'));
+same('ISK uses two decimals (PaymentHooks list)', 150000, InvoiceMapper::toMinorUnits(1500, 'ISK'));
+same('MGA is zero-decimal', 1500, InvoiceMapper::toMinorUnits(1500, 'MGA'));
+same('back to major', 499.0, InvoiceMapper::toMajorUnits(49900, 'INR'));
+
+echo "Line items\n";
+$rows = [['description' => "Hosting\nStarter plan", 'amount' => 800.0], ['description' => 'Domain', 'amount' => 200.0]];
+$m = InvoiceMapper::lineItemsForBalance(7, $rows, 100000, 'INR');
+same('rows used when they equal the balance', 2, count($m['lineItems']));
+same('multi-line description flattened', 'Hosting Starter plan', $m['lineItems'][0]['description']);
+$m = InvoiceMapper::lineItemsForBalance(7, $rows, 118000, 'INR');
+same('single balance line when tax makes rows differ', [['description' => 'Invoice #7', 'quantity' => 1, 'unitPrice' => 118000]], $m['lineItems']);
+$m = InvoiceMapper::lineItemsForBalance(7, [['description' => 'Hosting', 'amount' => 1000.0], ['description' => 'Credit', 'amount' => -200.0]], 80000, 'INR');
+same('negative rows collapse to the balance', 80000, $m['lineItems'][0]['unitPrice']);
+same('subtotal is the balance', 80000, $m['subtotal_minor']);
+throws('nothing due fails', function () {
+    InvoiceMapper::lineItemsForBalance(7, [], 0, 'INR');
+}, \RuntimeException::class);
+
+echo "Checkout body\n";
+$mapped = ['lineItems' => [['description' => 'Invoice #9', 'quantity' => 1, 'unitPrice' => 100000]], 'subtotal_minor' => 100000];
+$b = CheckoutBuilder::build(config(['convenienceFeePercent' => '2']), 9, 'INR', $mapped, 'payment', 'https://billing.example.com/', 'ph_cus_1', 'c@example.com', '');
+same('currency upper case', 'INR', $b['currency']);
+same('line items always sent', 1, count($b['lineItems']));
+same('fee is an integer of the subtotal', 2000, $b['convenienceFee']);
+same('invoice id in metadata', '9', $b['metadata']['whmcs_invoice_id']);
+check('no webhookUrl (registered endpoint only)', !array_key_exists('webhookUrl', $b));
+same('success URL', 'https://billing.example.com/viewinvoice.php?id=9&paymentsuccess=true', $b['successUrl']);
+check('no priceId on one-time', !isset($b['metadata']['priceId']));
+$b = CheckoutBuilder::build(config(), 9, 'INR', $mapped, 'subscription', 'https://billing.example.com', '', '', 'ph_pri_1');
+same('subscription price in metadata.priceId', 'ph_pri_1', $b['metadata']['priceId']);
+check('no top-level priceId', !array_key_exists('priceId', $b));
+check('no empty customer fields', !array_key_exists('customerId', $b) && !array_key_exists('customerEmail', $b));
+check('no fee field without a fee', !array_key_exists('convenienceFee', $b));
+$b = CheckoutBuilder::build(config(), 9, 'INR', $mapped, 'payment', 'https://billing.example.com', '', '', '');
+same('taxAmount 0 so PaymentHooks auto-tax never taxes the WHMCS balance again', 0, $b['taxAmount']);
+$k1 = CheckoutBuilder::idempotencyKey('aaaa', 9, 100000, 'payment', 0);
+$k2 = CheckoutBuilder::idempotencyKey('bbbb', 9, 100000, 'payment', 0);
+check('idempotency key differs per install', $k1 !== $k2);
+check('idempotency key fits the 200 limit', strlen($k1) <= 200 && Client::idempotencyKey($k1) === $k1);
+throws('subscription without price fails', function () use ($mapped) {
+    CheckoutBuilder::build(config(), 9, 'INR', $mapped, 'subscription', 'https://b.example.com', '', '', '');
+}, \InvalidArgumentException::class);
+throws('missing currency fails', function () use ($mapped) {
+    CheckoutBuilder::build(config(), 9, '', $mapped, 'payment', 'https://b.example.com', '', '', '');
+}, \InvalidArgumentException::class);
+
+echo "Events (live payload shapes)\n";
+$e = EventParser::checkoutCompleted(fixture('checkout_session_completed'));
+same('completed: session id', 'cs_whmcs_1', $e['sessionId']);
+same('completed: payment id from payment_intent', 'ph_pay_whmcs_1', $e['paymentId']);
+same('completed: amount_total in minor units', 102000, $e['amountMinor']);
+same('completed: currency upper-cased', 'INR', $e['currency']);
+same('completed: invoice id from metadata', 1001, $e['invoiceId']);
+same('completed: paid', true, $e['paid']);
+same('completed: no subscription', '', $e['subscriptionId']);
+$e = EventParser::checkoutCompleted(fixture('checkout_session_completed_subscription'));
+same('subscription checkout: subscription id', 'ph_sub_whmcs_1', $e['subscriptionId']);
+$r = EventParser::paymentRefunded(fixture('payment_refunded'));
+same('refunded: payment id', 'ph_pay_whmcs_1', $r['paymentId']);
+same('refunded: amount refunded', 50000, $r['amountRefundedMinor']);
+$s = EventParser::subscription(fixture('subscription_renewed'));
+same('renewed: subscription id', 'ph_sub_whmcs_1', $s['subscriptionId']);
+same('renewed: payment id from latest_payment', 'ph_pay_whmcs_3', $s['paymentId']);
+same('renewed: amount', 49900, $s['amountMinor']);
+same('renewed: currency', 'INR', $s['currency']);
+$s = EventParser::subscription(fixture('subscription_renewed_credit'));
+same('credit-covered renewal has no payment', '', $s['paymentId']);
+$s = EventParser::subscription(fixture('subscription_cancelled'));
+same('cancelled: id and status', ['ph_sub_whmcs_1', 'cancelled'], [$s['subscriptionId'], $s['status']]);
+same('non-numeric invoice id ignored', 0, EventParser::invoiceId(['metadata' => ['whmcs_invoice_id' => '1 OR 1=1']]));
+$f = fixture('checkout_session_completed');
+$f['data']['object']['amount_total'] = 102000.0;
+same('amount encoded as a whole float is read', 102000, EventParser::checkoutCompleted($f)['amountMinor']);
+$f['data']['object']['amount_total'] = 1020.5;
+same('fractional amount rejected', 0, EventParser::checkoutCompleted($f)['amountMinor']);
+
+echo "Billing cycles\n";
+$cycles = [
+    'Weekly' => ['week', 1], 'Monthly' => ['month', 1], 'Quarterly' => ['month', 3], 'Semi-Annually' => ['month', 6],
+    'Annually' => ['year', 1], 'Biennially' => ['year', 2], 'Triennially' => ['year', 3],
+];
+foreach ($cycles as $cycle => [$interval, $n]) {
+    same("{$cycle} -> {$interval} x{$n}", [$interval, $n], [PriceResolver::cycleToInterval($cycle), PriceResolver::cycleToIntervalCount($cycle)]);
+}
+same('One Time is not recurring', null, PriceResolver::cycleToInterval('One Time'));
+
+echo "Customer body\n";
+same('name, email, phone and country from the client',
+    ['name' => 'Asha Rao', 'email' => 'asha@example.com', 'phone' => '+91.9876543210', 'country' => 'IN'],
+    CheckoutBuilder::customerBody(['firstname' => 'Asha', 'lastname' => 'Rao', 'email' => ' asha@example.com ', 'phonenumber' => '+91.9876543210', 'country' => 'in']));
+same('company name when the client has no personal name',
+    ['name' => 'MR Innovations', 'email' => 'ops@example.com'],
+    CheckoutBuilder::customerBody(['firstname' => '', 'lastname' => '', 'companyname' => 'MR Innovations', 'email' => 'ops@example.com']));
+same('email as name when nothing else is known',
+    ['name' => 'x@example.com', 'email' => 'x@example.com'],
+    CheckoutBuilder::customerBody(['email' => 'x@example.com', 'phonenumber' => '  ']));
+$threw = false;
+try { CheckoutBuilder::customerBody(['firstname' => 'A']); } catch (\InvalidArgumentException $e) { $threw = true; }
+same('client without email is refused', true, $threw);
+
+echo "\n{$count} checks, {$failures} failed\n";
+exit($failures === 0 ? 0 : 1);

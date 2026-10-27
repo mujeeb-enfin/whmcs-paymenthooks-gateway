@@ -333,17 +333,11 @@ function claim_event(string $eventId, string $type, Logger $logger): bool
 function resolve_customer_id(Client $client, int $userId): string
 {
     $row = Capsule::table('tblclients')->where('id', $userId)->first();
-    $email = $row ? trim((string) $row->email) : '';
-    if ($email === '') {
+    if (!$row || trim((string) $row->email) === '') {
         throw new \RuntimeException('WHMCS client ' . $userId . ' has no email address.');
     }
-
-    $name = trim($row->firstname . ' ' . $row->lastname);
-    $body = ['name' => $name !== '' ? $name : $email, 'email' => $email];
-    $country = strtoupper(trim((string) $row->country));
-    if ($country !== '' && strlen($country) <= 5) {
-        $body['country'] = $country;
-    }
+    $body = CheckoutBuilder::customerBody((array) $row);
+    $email = $body['email'];
 
     try {
         $resp = $client->post('/customers', $body);
@@ -362,6 +356,11 @@ function resolve_customer_id(Client $client, int $userId): string
     $list = $client->get('/customers', ['search' => $email, 'pageSize' => 100]);
     foreach ($list['data'] ?? [] as $customer) {
         if (strcasecmp((string) ($customer['email'] ?? ''), $email) === 0 && !empty($customer['id'])) {
+            // Fill in a phone WHMCS has and PaymentHooks lacks, so checkout
+            // does not ask the client for it. Never overwrite a stored value.
+            if (isset($body['phone']) && trim((string) ($customer['phone'] ?? '')) === '') {
+                $client->put('/customers/' . rawurlencode((string) $customer['id']), ['phone' => $body['phone']]);
+            }
             return (string) $customer['id'];
         }
     }
