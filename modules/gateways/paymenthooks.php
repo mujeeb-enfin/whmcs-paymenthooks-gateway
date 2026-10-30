@@ -25,6 +25,7 @@ use PaymentHooks\Client;
 use PaymentHooks\Logger;
 use PaymentHooks\Schema;
 use PaymentHooks\InvoiceMapper;
+use PaymentHooks\RefundMapper;
 
 /**
  * Module metadata and capability flags.
@@ -210,7 +211,8 @@ function paymenthooks_link($params)
 
 /**
  * Refund handler, called when an admin refunds a transaction. WHMCS always
- * passes the amount (full or partial); PaymentHooks requires it.
+ * passes the amount (full or partial) in the invoice currency; PaymentHooks
+ * requires it in USD cents (see RefundMapper).
  */
 function paymenthooks_refund($params)
 {
@@ -231,10 +233,6 @@ function paymenthooks_refund($params)
     }
 
     $amountMinor = InvoiceMapper::toMinorUnits($amount, $currency);
-    $body = [
-        'amount' => $amountMinor,
-        'reason' => 'Refund issued from WHMCS for invoice ' . ($params['invoiceid'] ?? ''),
-    ];
     // Payment + amount + refunds already recorded: a double click is one
     // refund, a second intended refund of the same amount is a new one.
     $refundsSoFar = (int) Capsule::table('tblaccounts')
@@ -243,8 +241,22 @@ function paymenthooks_refund($params)
         ->where('amountout', '>', 0)
         ->count();
 
+    $client = new Client($config, $logger);
     try {
-        $resp = (new Client($config, $logger))->post(
+        // PaymentHooks takes the refund amount in USD cents; map the WHMCS
+        // amount (invoice currency) through the payment's own transaction fields.
+        $payment = $client->get('/payments/' . rawurlencode($paymentId))['data'] ?? [];
+        $amountUsdCents = RefundMapper::usdCents(is_array($payment) ? $payment : [], $amountMinor, $currency);
+    } catch (ApiException $e) {
+        return ['status' => 'declined', 'rawdata' => $e->errorCode . ': ' . $e->getMessage()];
+    } catch (\RuntimeException $e) {
+        $logger->error('refund-map', compact('paymentId', 'amountMinor', 'currency'), $e->getMessage());
+        return ['status' => 'declined', 'rawdata' => $e->getMessage()];
+    }
+    $body = RefundMapper::body($amountUsdCents, 'Refund issued from WHMCS for invoice ' . ($params['invoiceid'] ?? ''));
+
+    try {
+        $resp = $client->post(
             '/payments/' . rawurlencode($paymentId) . '/refund',
             $body,
             'refund-' . $paymentId . '-' . $amountMinor . '-' . $refundsSoFar

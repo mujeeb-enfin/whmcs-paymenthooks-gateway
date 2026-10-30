@@ -130,7 +130,7 @@ function handle_checkout_click(Config $config, Logger $logger, array $params): v
             'invoice_id' => $invoiceId,
             'session_id' => $sessionId,
             'status'     => 'open',
-            'fee_minor'  => (int) ($body['convenienceFee'] ?? 0),
+            'fee_minor'  => (int) ($body['itemConvenienceFeeLocalCurrencyAmount'] ?? 0),
             'created_at' => $now,
             'updated_at' => $now,
         ]);
@@ -193,7 +193,8 @@ function reusable_session_url(Client $client, Config $config, int $invoiceId, in
     $expiresAt = isset($s['expiresAt']) ? strtotime((string) $s['expiresAt']) : false;
     // A minute of margin so the client is not sent to a page about to expire.
     $stillOpen = ($s['status'] ?? '') === 'open' && $expiresAt !== false && $expiresAt > time() + 60;
-    $sameBalance = (int) ($s['subtotal'] ?? -1) === $subtotalMinor;
+    // The session's line-item subtotal, in the invoice currency's minor units.
+    $sameBalance = (int) ($s['itemSubtotalLocalCurrencyAmount'] ?? -1) === $subtotalMinor;
     $sameMode = ($s['mode'] ?? '') === $mode;
     if ($stillOpen && $sameBalance && $sameMode && !empty($s['url'])) {
         return $config->checkoutUrl((string) $s['url']);

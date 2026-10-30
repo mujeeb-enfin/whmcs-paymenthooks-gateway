@@ -4,14 +4,17 @@
  * WHMCS calls) so the request shape is unit-tested in tests/run.php.
  *
  * Contract (PaymentHooks /api/v1/checkout-sessions):
- *   lineItems[]   required: { description, quantity >= 1, unitPrice >= 0 } in minor units
- *   currency      ISO code, upper case; amounts stay in this currency
- *   mode          "payment" | "subscription"
- *   metadata      the subscription price goes in metadata.priceId (the only
- *                 place the server reads it)
- *   convenienceFee integer minor units, added to the total by the server
- *   taxAmount     always 0: the WHMCS balance already includes WHMCS tax, and
- *                 without it PaymentHooks auto-tax would charge tax again
+ *   lineItems[]       required: { description, quantity >= 1, unitPrice >= 0 } in
+ *                     minor units of itemLocalCurrency
+ *   itemLocalCurrency required ISO code, upper case; amounts stay in this currency
+ *   mode              "payment" | "subscription"
+ *   metadata          the subscription price goes in metadata.priceId (the only
+ *                     place the server reads it)
+ *   itemConvenienceFeeLocalCurrencyAmount
+ *                     integer minor units, added to the total by the server
+ *   itemTaxLocalCurrencyAmount
+ *                     always 0: the WHMCS balance already includes WHMCS tax, and
+ *                     without it PaymentHooks auto-tax would charge tax again
  *
  * No webhookUrl is sent: events reach WHMCS through the registered webhook
  * endpoint only, signed with its secret. Sending webhookUrl as well would
@@ -58,13 +61,13 @@ class CheckoutBuilder
         }
 
         $body = [
-            'mode'        => $mode,
-            'currency'    => $currency,
-            'lineItems'   => $mapped['lineItems'],
-            'successUrl'  => $systemUrl . '/viewinvoice.php?id=' . $invoiceId . '&paymentsuccess=true',
-            'cancelUrl'   => $systemUrl . '/viewinvoice.php?id=' . $invoiceId . '&paymentfailed=true',
-            'metadata'    => $metadata,
-            'taxAmount'   => 0,
+            'mode'                       => $mode,
+            'itemLocalCurrency'          => $currency,
+            'lineItems'                  => $mapped['lineItems'],
+            'successUrl'                 => $systemUrl . '/viewinvoice.php?id=' . $invoiceId . '&paymentsuccess=true',
+            'cancelUrl'                  => $systemUrl . '/viewinvoice.php?id=' . $invoiceId . '&paymentfailed=true',
+            'metadata'                   => $metadata,
+            'itemTaxLocalCurrencyAmount' => 0,
         ];
 
         $description = trim(strtr($config->descriptionTemplate, ['{invoiceid}' => (string) $invoiceId]));
@@ -80,7 +83,7 @@ class CheckoutBuilder
 
         $fee = self::convenienceFeeMinor($config, (int) $mapped['subtotal_minor']);
         if ($fee > 0) {
-            $body['convenienceFee'] = $fee;
+            $body['itemConvenienceFeeLocalCurrencyAmount'] = $fee;
         }
         return $body;
     }

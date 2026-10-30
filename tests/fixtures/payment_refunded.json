@@ -15,6 +15,8 @@
       "amount_details": null,
       "application_fee_amount": null,
       "currency": "inr",
+      "amount_usd_cents": 1071,
+      "usd_to_local_currency_rate": 95.2381,
       "customer": null,
       "description": null,
       "status": "succeeded",

@@ -26,8 +26,10 @@ if (!class_exists('WHMCS\\Database\\Capsule')) {
     eval('namespace WHMCS\\Database; class Capsule {}');
 }
 require_once $lib . 'InvoiceMapper.php';
+require_once $lib . 'RefundMapper.php';
 
 use PaymentHooks\CheckoutBuilder;
+use PaymentHooks\RefundMapper;
 use PaymentHooks\Client;
 use PaymentHooks\Config;
 use PaymentHooks\ConfigException;
@@ -147,9 +149,11 @@ throws('nothing due fails', function () {
 echo "Checkout body\n";
 $mapped = ['lineItems' => [['description' => 'Invoice #9', 'quantity' => 1, 'unitPrice' => 100000]], 'subtotal_minor' => 100000];
 $b = CheckoutBuilder::build(config(['convenienceFeePercent' => '2']), 9, 'INR', $mapped, 'payment', 'https://billing.example.com/', 'ph_cus_1', 'c@example.com', '');
-same('currency upper case', 'INR', $b['currency']);
+same('itemLocalCurrency upper case', 'INR', $b['itemLocalCurrency']);
+check('no retired currency field', !array_key_exists('currency', $b));
+same('line items carry unitPrice in minor units', 100000, $b['lineItems'][0]['unitPrice']);
 same('line items always sent', 1, count($b['lineItems']));
-same('fee is an integer of the subtotal', 2000, $b['convenienceFee']);
+same('fee is an integer of the subtotal', 2000, $b['itemConvenienceFeeLocalCurrencyAmount']);
 same('invoice id in metadata', '9', $b['metadata']['whmcs_invoice_id']);
 check('no webhookUrl (registered endpoint only)', !array_key_exists('webhookUrl', $b));
 same('success URL', 'https://billing.example.com/viewinvoice.php?id=9&paymentsuccess=true', $b['successUrl']);
@@ -158,9 +162,10 @@ $b = CheckoutBuilder::build(config(), 9, 'INR', $mapped, 'subscription', 'https:
 same('subscription price in metadata.priceId', 'ph_pri_1', $b['metadata']['priceId']);
 check('no top-level priceId', !array_key_exists('priceId', $b));
 check('no empty customer fields', !array_key_exists('customerId', $b) && !array_key_exists('customerEmail', $b));
-check('no fee field without a fee', !array_key_exists('convenienceFee', $b));
+check('no fee field without a fee', !array_key_exists('itemConvenienceFeeLocalCurrencyAmount', $b));
 $b = CheckoutBuilder::build(config(), 9, 'INR', $mapped, 'payment', 'https://billing.example.com', '', '', '');
-same('taxAmount 0 so PaymentHooks auto-tax never taxes the WHMCS balance again', 0, $b['taxAmount']);
+same('itemTaxLocalCurrencyAmount 0 so PaymentHooks auto-tax never taxes the WHMCS balance again', 0, $b['itemTaxLocalCurrencyAmount']);
+check('no retired taxAmount / convenienceFee fields', !array_key_exists('taxAmount', $b) && !array_key_exists('convenienceFee', $b));
 $k1 = CheckoutBuilder::idempotencyKey('aaaa', 9, 100000, 'payment', 0);
 $k2 = CheckoutBuilder::idempotencyKey('bbbb', 9, 100000, 'payment', 0);
 check('idempotency key differs per install', $k1 !== $k2);
@@ -178,6 +183,7 @@ same('completed: session id', 'cs_whmcs_1', $e['sessionId']);
 same('completed: payment id from payment_intent', 'ph_pay_whmcs_1', $e['paymentId']);
 same('completed: amount_total in minor units', 102000, $e['amountMinor']);
 same('completed: currency upper-cased', 'INR', $e['currency']);
+same('completed: amount_usd_cents read', 1074, $e['amountUsdCents']);
 same('completed: invoice id from metadata', 1001, $e['invoiceId']);
 same('completed: paid', true, $e['paid']);
 same('completed: no subscription', '', $e['subscriptionId']);
@@ -186,6 +192,7 @@ same('subscription checkout: subscription id', 'ph_sub_whmcs_1', $e['subscriptio
 $r = EventParser::paymentRefunded(fixture('payment_refunded'));
 same('refunded: payment id', 'ph_pay_whmcs_1', $r['paymentId']);
 same('refunded: amount refunded', 50000, $r['amountRefundedMinor']);
+same('refunded: amount_usd_cents read', 1071, $r['amountUsdCents']);
 $s = EventParser::subscription(fixture('subscription_renewed'));
 same('renewed: subscription id', 'ph_sub_whmcs_1', $s['subscriptionId']);
 same('renewed: payment id from latest_payment', 'ph_pay_whmcs_3', $s['paymentId']);
@@ -211,6 +218,39 @@ foreach ($cycles as $cycle => [$interval, $n]) {
     same("{$cycle} -> {$interval} x{$n}", [$interval, $n], [PriceResolver::cycleToInterval($cycle), PriceResolver::cycleToIntervalCount($cycle)]);
 }
 same('One Time is not recurring', null, PriceResolver::cycleToInterval('One Time'));
+
+echo "Price body\n";
+same('price body uses itemLocalCurrency fields',
+    ['productId' => 'prod_1', 'itemLocalCurrencyAmount' => 49900, 'itemLocalCurrency' => 'INR', 'type' => 'recurring', 'interval' => 'month', 'intervalCount' => 3],
+    PriceResolver::priceBody('prod_1', 49900, 'inr', 'month', 3));
+check('no intervalCount for a single period', !array_key_exists('intervalCount', PriceResolver::priceBody('prod_1', 49900, 'INR', 'month', 1)));
+
+echo "Refund amount (USD cents)\n";
+$pay = ['transactionLocalCurrency' => 'INR', 'transactionLocalCurrencyAmount' => 102000, 'transactionAmountUsdCents' => 1071, 'transactionRefundedAmountUsdCents' => null];
+same('full refund is the whole USD charge', 1071, RefundMapper::usdCents($pay, 102000, 'INR'));
+same('partial refund is pro rata', 525, RefundMapper::usdCents($pay, 50000, 'inr'));
+$partly = ['transactionRefundedAmountUsdCents' => 525] + $pay;
+same('refunding the rest after a partial is the USD remainder', 546, RefundMapper::usdCents($partly, 52000, 'INR'));
+throws('refunding the whole charge again after a partial refused', function () use ($partly) {
+    RefundMapper::usdCents($partly, 102000, 'INR');
+}, \RuntimeException::class);
+throws('refund under one US cent refused', function () use ($pay) {
+    RefundMapper::usdCents($pay, 10, 'INR');
+}, \RuntimeException::class);
+same('USD payment refunds the same cents', 700, RefundMapper::usdCents(['transactionLocalCurrency' => 'USD', 'transactionLocalCurrencyAmount' => 2000, 'transactionAmountUsdCents' => 2000], 700, 'USD'));
+same('refund body sends transactionAmountUsdCents', ['transactionAmountUsdCents' => 525, 'reason' => 'r'], RefundMapper::body(525, 'r'));
+throws('currency mismatch refused', function () use ($pay) {
+    RefundMapper::usdCents($pay, 50000, 'USD');
+}, \RuntimeException::class);
+throws('refund above the charge refused', function () use ($pay) {
+    RefundMapper::usdCents($pay, 102001, 'INR');
+}, \RuntimeException::class);
+throws('payment without transaction amounts refused', function () {
+    RefundMapper::usdCents(['transactionLocalCurrency' => 'INR'], 100, 'INR');
+}, \RuntimeException::class);
+throws('fully refunded payment refused', function () use ($pay) {
+    RefundMapper::usdCents(['transactionRefundedAmountUsdCents' => 1071] + $pay, 100, 'INR');
+}, \RuntimeException::class);
 
 echo "Customer body\n";
 same('name, email, phone and country from the client',

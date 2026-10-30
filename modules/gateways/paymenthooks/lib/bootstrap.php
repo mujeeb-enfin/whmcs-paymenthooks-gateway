@@ -14,6 +14,7 @@ require_once __DIR__ . '/Client.php';
 require_once __DIR__ . '/Signature.php';
 require_once __DIR__ . '/Schema.php';
 require_once __DIR__ . '/InvoiceMapper.php';
+require_once __DIR__ . '/RefundMapper.php';
 require_once __DIR__ . '/EventParser.php';
 require_once __DIR__ . '/CheckoutBuilder.php';
 require_once __DIR__ . '/PriceResolver.php';

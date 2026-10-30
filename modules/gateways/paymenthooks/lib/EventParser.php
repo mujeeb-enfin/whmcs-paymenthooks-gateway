@@ -8,10 +8,16 @@
  *   checkout.session.completed      object = checkout session
  *     id, status ("complete"), payment_status ("paid"), payment_intent (payment id),
  *     amount_total (smallest unit of currency), currency (lowercase),
+ *     amount_usd_cents (the same total in USD cents), usd_to_local_currency_rate,
  *     subscription (id|null), mode, metadata (string values)
  *   checkout.session.payment_failed object = checkout session (payment_status "unpaid")
  *   payment.refunded                object = payment intent
- *     id (payment id), amount, currency, charges.data[0].amount_refunded, metadata
+ *     id (payment id), amount, currency, amount_usd_cents,
+ *     charges.data[0].amount_refunded, metadata
+ *
+ * Webhooks keep Stripe's shapes: amount / amount_total / amount_refunded are
+ * the local amount in `currency`, which is what WHMCS records. The USD cents
+ * are informational (Gateway Log) only.
  *   subscription.renewed            object = subscription
  *     id, latest_payment { id, amount, currency } (absent when credit covered it)
  *   subscription.renewal_failed     object = subscription
@@ -38,7 +44,7 @@ class EventParser
     /**
      * Completed checkout session.
      *
-     * @return array{sessionId:string,paymentId:string,amountMinor:int,currency:string,subscriptionId:string,invoiceId:int,paid:bool}
+     * @return array{sessionId:string,paymentId:string,amountMinor:int,amountUsdCents:int,currency:string,subscriptionId:string,invoiceId:int,paid:bool}
      */
     public static function checkoutCompleted(array $event): array
     {
@@ -47,6 +53,7 @@ class EventParser
             'sessionId'      => self::str($o['id'] ?? null),
             'paymentId'      => self::str($o['payment_intent'] ?? null),
             'amountMinor'    => self::int($o['amount_total'] ?? null),
+            'amountUsdCents' => self::int($o['amount_usd_cents'] ?? null),
             'currency'       => strtoupper(self::str($o['currency'] ?? null)),
             'subscriptionId' => self::str($o['subscription'] ?? null),
             'invoiceId'      => self::invoiceId($o),
@@ -57,7 +64,7 @@ class EventParser
     /**
      * Refunded payment.
      *
-     * @return array{paymentId:string,amountRefundedMinor:int,currency:string,invoiceId:int}
+     * @return array{paymentId:string,amountRefundedMinor:int,amountUsdCents:int,currency:string,invoiceId:int}
      */
     public static function paymentRefunded(array $event): array
     {
@@ -66,6 +73,7 @@ class EventParser
         return [
             'paymentId'           => self::str($o['id'] ?? null),
             'amountRefundedMinor' => self::int(is_array($charge) ? ($charge['amount_refunded'] ?? null) : null),
+            'amountUsdCents'      => self::int($o['amount_usd_cents'] ?? null),
             'currency'            => strtoupper(self::str($o['currency'] ?? null)),
             'invoiceId'           => self::invoiceId($o),
         ];

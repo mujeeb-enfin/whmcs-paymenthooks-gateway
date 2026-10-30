@@ -14,6 +14,8 @@
       "amount_total": 49900,
       "amount_subtotal": 49900,
       "currency": "inr",
+      "amount_usd_cents": 525,
+      "usd_to_local_currency_rate": 95,
       "mode": "subscription",
       "customer": null,
       "customer_email": null,

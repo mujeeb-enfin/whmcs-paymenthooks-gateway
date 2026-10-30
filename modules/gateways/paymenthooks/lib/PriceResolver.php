@@ -173,16 +173,7 @@ class PriceResolver
 
     private function createPrice(string $phProductId, int $amountMinor, string $currency, string $interval, int $intervalCount): string
     {
-        $body = [
-                'productId' => $phProductId,
-                'amount'    => $amountMinor,
-                'currency'  => $currency,
-                'type'      => 'recurring',
-                'interval'  => $interval,
-            ];
-            if ($intervalCount > 1) {
-                $body['intervalCount'] = $intervalCount;
-            }
+        $body = self::priceBody($phProductId, $amountMinor, $currency, $interval, $intervalCount);
         try {
             $resp = $this->client->post('/prices', $body);
         } catch (ApiException $e) {
@@ -194,6 +185,25 @@ class PriceResolver
             throw new \RuntimeException('PaymentHooks returned no price id.');
         }
         return $id;
+    }
+
+    /**
+     * POST /prices body: the recurring price in the invoice currency's minor
+     * units (PaymentHooks stores USD cents alongside at the live rate).
+     */
+    public static function priceBody(string $phProductId, int $amountMinor, string $currency, string $interval, int $intervalCount): array
+    {
+        $body = [
+            'productId'               => $phProductId,
+            'itemLocalCurrencyAmount' => $amountMinor,
+            'itemLocalCurrency'       => strtoupper($currency),
+            'type'                    => 'recurring',
+            'interval'                => $interval,
+        ];
+        if ($intervalCount > 1) {
+            $body['intervalCount'] = $intervalCount;
+        }
+        return $body;
     }
 
     /**

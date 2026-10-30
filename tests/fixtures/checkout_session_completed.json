@@ -14,6 +14,8 @@
       "amount_total": 102000,
       "amount_subtotal": 102000,
       "currency": "inr",
+      "amount_usd_cents": 1074,
+      "usd_to_local_currency_rate": 95,
       "mode": "payment",
       "customer": "ph_cus_1",
       "customer_email": "client@example.com",

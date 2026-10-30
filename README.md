@@ -40,6 +40,7 @@ Cards are entered only on the PaymentHooks page, never in WHMCS. The module stor
    modules/gateways/paymenthooks/lib/Client.php           PaymentHooks API client
    modules/gateways/paymenthooks/lib/CheckoutBuilder.php  checkout session request
    modules/gateways/paymenthooks/lib/InvoiceMapper.php    invoice balance, line items, amounts
+   modules/gateways/paymenthooks/lib/RefundMapper.php     refund amount in USD cents
    modules/gateways/paymenthooks/lib/PriceResolver.php    recurring product and price mapping
    modules/gateways/paymenthooks/lib/EventParser.php      webhook event fields
    modules/gateways/paymenthooks/lib/WebhookRouter.php    applies events to WHMCS
@@ -72,6 +73,23 @@ are kept. Tables are upgraded automatically on the next request:
 
 Versions before this one asked for `sk_`/`pk_` test and live keys. Enter your `phk_live_` secret key and
 the endpoint's `whsec_` secret again.
+
+### Money field rename (PaymentHooks API, 2026-10-29)
+
+The PaymentHooks REST API renamed its money fields (SDK 3.0.0) and accepts only the new names. Earlier
+module files send the retired names and fail with `VALIDATION_ERROR`; replace them. What changed in the
+module:
+
+| Call | Before | Now |
+| --- | --- | --- |
+| `POST /checkout-sessions` | `currency`, `taxAmount`, `convenienceFee` | `itemLocalCurrency`, `itemTaxLocalCurrencyAmount` (always 0), `itemConvenienceFeeLocalCurrencyAmount` (line items keep `unitPrice`, minor units) |
+| `POST /prices` | `amount`, `currency` | `itemLocalCurrencyAmount`, `itemLocalCurrency` |
+| `GET /checkout-sessions/:id` (session reuse) | `subtotal` | `itemSubtotalLocalCurrencyAmount` |
+| `POST /payments/:id/refund` | `amount` in the invoice currency's minor units | `transactionAmountUsdCents` (**USD cents**), mapped from the payment's `transactionLocalCurrencyAmount` / `transactionAmountUsdCents` (one extra `GET /payments/:id`) |
+
+Webhooks are unchanged: they keep Stripe's shapes (`amount_total`, `amount_refunded`, `currency`, ...),
+which is what the module records. They also carry `amount_usd_cents` and `usd_to_local_currency_rate`;
+the module reads `amount_usd_cents` for its logs only.
 
 ## PaymentHooks setup
 
@@ -223,8 +241,12 @@ One Time and Free products are never subscriptions.
 
 ## Refunds
 
-**Refund** on a PaymentHooks transaction in WHMCS calls `POST /payments/:id/refund` with the amount, full
-or partial, in the payment's currency. A refund made in the PaymentHooks dashboard arrives as
+**Refund** on a PaymentHooks transaction in WHMCS reads the payment (`GET /payments/:id`) and calls
+`POST /payments/:id/refund` with `transactionAmountUsdCents`: the amount, full or partial, converted to USD cents pro rata from what the
+payment charged (`transactionLocalCurrencyAmount` against `transactionAmountUsdCents`). PaymentHooks then
+refunds the gateway in the currency it charged. The refund is declined, with the reason in the Gateway Log,
+when the WHMCS currency differs from the charged currency, when it exceeds what is left to refund, or when it
+is under one US cent. A refund made in the PaymentHooks dashboard arrives as
 `payment.refunded` and is noted in the Gateway Log for you to reflect in WHMCS.
 
 ## Logs
@@ -253,7 +275,7 @@ Secrets are masked in every log.
 Without WHMCS or a network (PHP 7.4+):
 
 ```
-php tests/run.php              # signature, settings, amounts, line items, the checkout request, event parsing, billing cycles
+php tests/run.php              # signature, settings, amounts, line items, the checkout and price requests, refund USD cents, event parsing, billing cycles
 php tests/webhook-harness.php  # the full webhook path: what lands on invoices and in the Gateway Log for every event
 ```
 
