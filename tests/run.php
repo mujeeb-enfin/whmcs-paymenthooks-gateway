@@ -146,6 +146,17 @@ throws('nothing due fails', function () {
     InvoiceMapper::lineItemsForBalance(7, [], 0, 'INR');
 }, \RuntimeException::class);
 
+echo "WHMCS tax inside the balance\n";
+// 1000.00 + 18% GST = 1180.00 invoice; the tax already charged by WHMCS is sent as inclusive.
+$t = InvoiceMapper::taxInBalance(['total' => '1180.00', 'tax' => '180.00', 'tax2' => '0.00', 'taxrate' => '18.00', 'taxrate2' => '0.00'], 118000, 'INR');
+same('full balance carries all the tax', ['tax_minor' => 18000, 'tax_rate' => 18.0], $t);
+$t = InvoiceMapper::taxInBalance(['total' => '1180.00', 'tax' => '180.00', 'tax2' => '0.00', 'taxrate' => '18', 'taxrate2' => '0'], 59000, 'INR');
+same('half paid: half the tax is in the remaining balance', 9000, $t['tax_minor']);
+$t = InvoiceMapper::taxInBalance(['total' => '1200.00', 'tax' => '100.00', 'tax2' => '100.00', 'taxrate' => '9', 'taxrate2' => '9'], 120000, 'INR');
+same('tax + tax2 (CGST + SGST) combined', ['tax_minor' => 20000, 'tax_rate' => 18.0], $t);
+$t = InvoiceMapper::taxInBalance(['total' => '1000.00', 'tax' => '0.00', 'tax2' => '0.00'], 100000, 'INR');
+same('untaxed invoice sends no tax', ['tax_minor' => 0, 'tax_rate' => 0.0], $t);
+
 echo "Checkout body\n";
 $mapped = ['lineItems' => [['description' => 'Invoice #9', 'quantity' => 1, 'unitPrice' => 100000]], 'subtotal_minor' => 100000];
 $b = CheckoutBuilder::build(config(['convenienceFeePercent' => '2']), 9, 'INR', $mapped, 'payment', 'https://billing.example.com/', 'ph_cus_1', 'c@example.com', '');
@@ -165,6 +176,16 @@ check('no empty customer fields', !array_key_exists('customerId', $b) && !array_
 check('no fee field without a fee', !array_key_exists('itemConvenienceFeeLocalCurrencyAmount', $b));
 $b = CheckoutBuilder::build(config(), 9, 'INR', $mapped, 'payment', 'https://billing.example.com', '', '', '');
 same('itemTaxLocalCurrencyAmount 0 so PaymentHooks auto-tax never taxes the WHMCS balance again', 0, $b['itemTaxLocalCurrencyAmount']);
+same('tax is declared inclusive so auto-tax never adds to the WHMCS balance', 'inclusive', $b['taxBehavior']);
+$taxed = $mapped + ['tax_minor' => 15254, 'tax_rate' => 18.0];
+$b = CheckoutBuilder::build(config(), 9, 'INR', $taxed, 'payment', 'https://billing.example.com', '', '', '');
+same('WHMCS tax sent as the tax inside the total', 15254, $b['itemTaxLocalCurrencyAmount']);
+same('WHMCS rate sent for receipts and reports', 18.0, $b['taxRate']);
+check('no tax name unless configured', !array_key_exists('taxName', $b));
+$b = CheckoutBuilder::build(config(['taxName' => ' GST ']), 9, 'INR', $taxed, 'payment', 'https://billing.example.com', '', '', '');
+same('configured tax name sent with the tax', 'GST', $b['taxName']);
+$b = CheckoutBuilder::build(config(['taxName' => 'GST']), 9, 'INR', $mapped + ['tax_minor' => 0, 'tax_rate' => 0.0], 'payment', 'https://billing.example.com', '', '', '');
+check('no tax name on an untaxed invoice', !array_key_exists('taxName', $b));
 check('no retired taxAmount / convenienceFee fields', !array_key_exists('taxAmount', $b) && !array_key_exists('convenienceFee', $b));
 $k1 = CheckoutBuilder::idempotencyKey('aaaa', 9, 100000, 'payment', 0);
 $k2 = CheckoutBuilder::idempotencyKey('bbbb', 9, 100000, 'payment', 0);

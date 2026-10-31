@@ -43,7 +43,7 @@
               "tiers": null,
               "transform_quantity": null,
               "lookup_key": null,
-              "tax_behavior": "inclusive",
+              "tax_behavior": "unspecified",
               "currency_options": null,
               "custom_unit_amount": null
             },

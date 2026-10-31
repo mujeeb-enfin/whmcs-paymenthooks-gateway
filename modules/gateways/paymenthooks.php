@@ -109,6 +109,13 @@ function paymenthooks_config()
             'Default'      => 'Invoice {invoiceid}',
             'Description'  => 'Stored on the checkout session as metadata.description. {invoiceid} is replaced.',
         ],
+        'taxName' => [
+            'FriendlyName' => 'Tax Name',
+            'Type'         => 'text',
+            'Size'         => '20',
+            'Default'      => '',
+            'Description'  => 'Optional. Name of the tax your invoices carry (e.g. GST, VAT), shown on the checkout and receipt next to the WHMCS tax amount.',
+        ],
         'checkoutHeading' => [
             'FriendlyName' => 'Checkout Heading',
             'Type'         => 'text',

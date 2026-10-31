@@ -12,9 +12,11 @@
  *                     place the server reads it)
  *   itemConvenienceFeeLocalCurrencyAmount
  *                     integer minor units, added to the total by the server
- *   itemTaxLocalCurrencyAmount
- *                     always 0: the WHMCS balance already includes WHMCS tax, and
- *                     without it PaymentHooks auto-tax would charge tax again
+ *   itemTaxLocalCurrencyAmount + taxBehavior "inclusive"
+ *                     the WHMCS tax already inside the balance (0 when WHMCS
+ *                     charged none). Declaring it inclusive means PaymentHooks
+ *                     records and reports that tax but never adds tax again,
+ *                     and the customer pays exactly the WHMCS balance.
  *
  * No webhookUrl is sent: events reach WHMCS through the registered webhook
  * endpoint only, signed with its secret. Sending webhookUrl as well would
@@ -30,7 +32,7 @@ if (!defined('WHMCS')) {
 class CheckoutBuilder
 {
     /**
-     * @param array{lineItems: array, subtotal_minor: int} $mapped from InvoiceMapper
+     * @param array{lineItems: array, subtotal_minor: int, tax_minor?: int, tax_rate?: float} $mapped from InvoiceMapper
      * @return array request body
      */
     public static function build(
@@ -67,8 +69,16 @@ class CheckoutBuilder
             'successUrl'                 => $systemUrl . '/viewinvoice.php?id=' . $invoiceId . '&paymentsuccess=true',
             'cancelUrl'                  => $systemUrl . '/viewinvoice.php?id=' . $invoiceId . '&paymentfailed=true',
             'metadata'                   => $metadata,
-            'itemTaxLocalCurrencyAmount' => 0,
+            // WHMCS already charged this tax; it is inside the line items, never added on top.
+            'itemTaxLocalCurrencyAmount' => (int) ($mapped['tax_minor'] ?? 0),
+            'taxBehavior'                => 'inclusive',
         ];
+        if (($mapped['tax_rate'] ?? 0) > 0) {
+            $body['taxRate'] = (float) $mapped['tax_rate'];
+        }
+        if ($config->taxName !== '' && ($mapped['tax_minor'] ?? 0) > 0) {
+            $body['taxName'] = $config->taxName;
+        }
 
         $description = trim(strtr($config->descriptionTemplate, ['{invoiceid}' => (string) $invoiceId]));
         if ($description !== '') {

@@ -59,18 +59,44 @@ class InvoiceMapper
      * invoice total; otherwise (tax, credit, partial payments) a single line
      * for the balance due is sent so the customer pays exactly what is owed.
      *
-     * @return array{lineItems: array, subtotal_minor: int}
+     * @return array{lineItems: array, subtotal_minor: int, tax_minor: int, tax_rate: float}
      * @throws \RuntimeException when the invoice has nothing to pay
      */
     public static function buildLineItems(int $invoiceId, string $currency): array
     {
-        $balanceMinor = self::balanceMinor($invoiceId, $currency);
+        $invoice = self::getInvoice($invoiceId);
+        $balanceMinor = self::toMinorUnits((float) $invoice['balance'], $currency);
 
         $rows = [];
         foreach (Capsule::table('tblinvoiceitems')->where('invoiceid', $invoiceId)->orderBy('id')->get() as $row) {
             $rows[] = ['description' => (string) $row->description, 'amount' => (float) $row->amount];
         }
-        return self::lineItemsForBalance($invoiceId, $rows, $balanceMinor, $currency);
+        $mapped = self::lineItemsForBalance($invoiceId, $rows, $balanceMinor, $currency);
+        return $mapped + self::taxInBalance($invoice, $balanceMinor, $currency);
+    }
+
+    /**
+     * The tax WHMCS already charged that is inside the balance being paid.
+     * WHMCS adds its tax (tax + tax2) on top of the subtotal (or includes it,
+     * with "inclusive tax" on); either way the invoice total contains it. A
+     * partly paid invoice pays a share of it, in proportion to the balance.
+     * The checkout sends it as inclusive tax, so PaymentHooks records and
+     * reports it and never adds tax again.
+     *
+     * @param array<string, mixed> $invoice GetInvoice result
+     * @return array{tax_minor: int, tax_rate: float}
+     */
+    public static function taxInBalance(array $invoice, int $balanceMinor, string $currency): array
+    {
+        $totalMinor = self::toMinorUnits((float) ($invoice['total'] ?? 0), $currency);
+        $taxMinor = self::toMinorUnits((float) ($invoice['tax'] ?? 0), $currency) + self::toMinorUnits((float) ($invoice['tax2'] ?? 0), $currency);
+        if ($taxMinor <= 0 || $totalMinor <= 0 || $balanceMinor <= 0) {
+            return ['tax_minor' => 0, 'tax_rate' => 0.0];
+        }
+        $share = $balanceMinor >= $totalMinor ? $taxMinor : (int) round($taxMinor * $balanceMinor / $totalMinor);
+        // The combined rate WHMCS applied (taxrate + taxrate2 when compounded on top), for receipts and reports.
+        $rate = (float) ($invoice['taxrate'] ?? 0) + (float) ($invoice['taxrate2'] ?? 0);
+        return ['tax_minor' => min($share, $balanceMinor - 1), 'tax_rate' => $rate];
     }
 
     /**
@@ -79,11 +105,17 @@ class InvoiceMapper
      */
     public static function balanceMinor(int $invoiceId, string $currency): int
     {
+        return self::toMinorUnits((float) self::getInvoice($invoiceId)['balance'], $currency);
+    }
+
+    /** @return array<string, mixed> WHMCS GetInvoice result */
+    private static function getInvoice(int $invoiceId): array
+    {
         $result = localAPI('GetInvoice', ['invoiceid' => $invoiceId]);
         if (($result['result'] ?? '') !== 'success') {
             throw new \RuntimeException('Invoice ' . $invoiceId . ' could not be loaded: ' . ($result['message'] ?? 'unknown error'));
         }
-        return self::toMinorUnits((float) $result['balance'], $currency);
+        return $result;
     }
 
     /**

@@ -38,6 +38,8 @@ class Config
     public $convenienceFeePercent;
     /** @var string */
     public $descriptionTemplate = 'Invoice {invoiceid}';
+    /** @var string name of the invoice tax (GST, VAT), '' for "Tax" */
+    public $taxName = '';
     /** @var bool */
     public $subscriptionsEnabled = false;
     /** @var string one of: auto, subscription, payment */
@@ -58,6 +60,7 @@ class Config
 
         $template = trim((string) ($params['descriptionTemplate'] ?? ''));
         $c->descriptionTemplate  = $template !== '' ? $template : 'Invoice {invoiceid}';
+        $c->taxName = mb_substr(trim((string) ($params['taxName'] ?? '')), 0, 60);
         $c->subscriptionsEnabled = !empty($params['enableSubscriptions']) && $params['enableSubscriptions'] !== 'off';
 
         $policy = (string) ($params['paymentModePolicy'] ?? 'auto');
