@@ -202,8 +202,14 @@ When the client clicks **Pay Now** or **Subscribe & Auto-pay**:
 
 The session is for the invoice **balance** (total less payments and credit, as WHMCS reports it), in the
 client's WHMCS currency, with WHMCS tax already included. The module tells PaymentHooks not to add tax.
-If the invoice rows add up to the balance they are shown as line items; otherwise one line "Invoice #N"
-for the balance is sent.
+Pay Now sends the invoice's own rows as line items, built like the Subscribe & Auto-pay lines:
+promotion lines are folded into the item they discount, exclusive WHMCS tax is spread over the taxed
+rows (each line is its price with tax; the tax amount is still sent so the checkout and receipt show
+it), and on a part-paid or credit-applied invoice each row is scaled to its share of the balance
+(remainder on the last row; the amount already paid or credited is sent as session metadata). Only
+when the rows cannot add up to the balance exactly (for example a negative line not tied to an item,
+since PaymentHooks line items cannot be negative) is one line "Invoice #N" for the balance sent, and
+the reason is written to the Activity Log as `PaymentHooks info [checkout-single-line]`.
 
 Checkout stops with an error, instead of charging a different amount, when:
 

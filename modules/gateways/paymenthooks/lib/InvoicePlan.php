@@ -92,7 +92,8 @@ class InvoicePlan
      * Pure (unit-tested): folds each promotion line into the line of the item
      * it discounts (same relid, matching type), so the item's line is what
      * this period really costs. A promo line without its item stays as it is
-     * (and, being negative, stops the Subscribe offer with a reason).
+     * (and, being negative, stops the Subscribe offer with a reason, and
+     * makes the one-time checkout send a single balance line).
      */
     public static function netPromotions(array $lines): array
     {
@@ -176,7 +177,9 @@ class InvoicePlan
      * Pure (unit-tested): spreads exclusive WHMCS tax over the taxed lines so
      * the lines add up to the invoice total, and scales each subscribed
      * renewal price by its line's tax share. Lines already adding up to the
-     * total (inclusive tax, or none) are left as they are.
+     * total (inclusive tax, or none) are left as they are. Shared by the
+     * Subscribe & Auto-pay plan and the one-time checkout lines
+     * (InvoiceMapper::oneTimeLines), so both show the same gross lines.
      */
     public static function allocateTax(array $rows, int $taxMinor, int $totalMinor): array
     {

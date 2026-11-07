@@ -147,18 +147,73 @@ same('ISK uses two decimals (PaymentHooks list)', 150000, InvoiceMapper::toMinor
 same('MGA is zero-decimal', 1500, InvoiceMapper::toMinorUnits(1500, 'MGA'));
 same('back to major', 499.0, InvoiceMapper::toMajorUnits(49900, 'INR'));
 
-echo "Line items\n";
-$rows = [['description' => "Hosting\nStarter plan", 'amount' => 800.0], ['description' => 'Domain', 'amount' => 200.0]];
-$m = InvoiceMapper::lineItemsForBalance(7, $rows, 100000, 'INR');
-same('rows used when they equal the balance', 2, count($m['lineItems']));
+echo "One-time line items\n";
+$tot = function (int $total, int $tax = 0, int $balance = -1, int $credit = 0): array {
+    return ['totalMinor' => $total, 'taxMinor' => $tax, 'creditMinor' => $credit, 'balanceMinor' => $balance < 0 ? $total : $balance];
+};
+$unit = function (array $m): array { return array_column($m['lineItems'], 'unitPrice'); };
+$hostLine = ['type' => 'Hosting', 'relId' => 77, 'description' => "Hosting\nStarter plan", 'amountMinor' => 80000, 'taxed' => true];
+$domLine = ['type' => 'DomainRegister', 'relId' => 12, 'description' => 'Domain', 'amountMinor' => 20000, 'taxed' => true];
+// No tax: 800 + 200 = 1,000.
+$m = InvoiceMapper::oneTimeLines(7, [$hostLine, $domLine], $tot(100000));
+same('no tax: invoice lines sent as they are', [80000, 20000], $unit($m));
+same('no tax: no fallback reason', '', $m['fallbackReason']);
 same('multi-line description flattened', 'Hosting Starter plan', $m['lineItems'][0]['description']);
-$m = InvoiceMapper::lineItemsForBalance(7, $rows, 118000, 'INR');
-same('single balance line when tax makes rows differ', [['description' => 'Invoice #7', 'quantity' => 1, 'unitPrice' => 118000]], $m['lineItems']);
-$m = InvoiceMapper::lineItemsForBalance(7, [['description' => 'Hosting', 'amount' => 1000.0], ['description' => 'Credit', 'amount' => -200.0]], 80000, 'INR');
-same('negative rows collapse to the balance', 80000, $m['lineItems'][0]['unitPrice']);
-same('subtotal is the balance', 80000, $m['subtotal_minor']);
-throws('nothing due fails', function () {
-    InvoiceMapper::lineItemsForBalance(7, [], 0, 'INR');
+same('quantity 1 per WHMCS row', [1, 1], array_column($m['lineItems'], 'quantity'));
+// 18% exclusive GST on both items: 1,000 + 180 = 1,180.
+$m = InvoiceMapper::oneTimeLines(7, [$hostLine, $domLine], $tot(118000, 18000));
+same('18% exclusive tax: two lines, each with its own tax', [94400, 23600], $unit($m));
+same('18% exclusive tax: lines add up to the total', 118000, array_sum($unit($m)));
+same('18% exclusive tax: no fallback', '', $m['fallbackReason']);
+$b = CheckoutBuilder::build(config(), 7, 'INR', $m + InvoiceMapper::taxInBalance(['total' => '1180.00', 'tax' => '180.00', 'tax2' => '0', 'taxrate' => '18', 'taxrate2' => '0'], 118000, 'INR'),
+    'payment', 'https://billing.example.com', '', '');
+same('18% exclusive tax: checkout sends both lines', ['Hosting Starter plan', 'Domain'], array_column($b['lineItems'], 'description'));
+same('18% exclusive tax: tax sent as inclusive, inside the lines', [18000, 'inclusive', 18.0], [$b['itemTaxLocalCurrencyAmount'], $b['taxBehavior'], $b['taxRate']]);
+check('fully unpaid invoice: no paid / credit metadata', !isset($b['metadata']['whmcs_already_paid']) && !isset($b['metadata']['whmcs_credit_applied']));
+// Tax on one line only, odd amounts: remainder lands on the last taxed line.
+$m = InvoiceMapper::oneTimeLines(7, [['description' => 'A', 'amountMinor' => 333, 'taxed' => true], ['description' => 'Untaxed', 'amountMinor' => 500, 'taxed' => false],
+    ['description' => 'B', 'amountMinor' => 334, 'taxed' => true]], $tot(1267, 100));
+same('mixed taxed / untaxed: tax only on taxed lines, remainder on the last', [382, 500, 385], $unit($m));
+// Inclusive tax: lines already equal the total (tax inside).
+$m = InvoiceMapper::oneTimeLines(7, [$hostLine, $domLine], $tot(100000, 15254));
+same('inclusive tax: lines untouched', [80000, 20000], $unit($m));
+// Single item.
+$m = InvoiceMapper::oneTimeLines(7, [['description' => 'Domain Renewal - example.com', 'amountMinor' => 129900, 'taxed' => true]], $tot(153282, 23382));
+same('single taxed item: one line at the gross price', [['description' => 'Domain Renewal - example.com', 'quantity' => 1, 'unitPrice' => 153282]], $m['lineItems']);
+// Promotion folded into the item it discounts, then taxed.
+$m = InvoiceMapper::oneTimeLines(7, [$hostLine, ['type' => 'PromoHosting', 'relId' => 77, 'description' => 'Promo: 25% off', 'amountMinor' => -20000, 'taxed' => true], $domLine],
+    $tot(94400, 14400));
+same('promo: folded into its service, then tax spread', [70800, 23600], $unit($m));
+same('promo: named on the service line', 'Hosting Starter plan (Promo: 25% off)', $m['lineItems'][0]['description']);
+$m = InvoiceMapper::oneTimeLines(7, [['type' => 'Hosting', 'relId' => 1, 'description' => 'Hosting', 'amountMinor' => 100000],
+    ['type' => 'Item', 'relId' => 0, 'description' => 'Goodwill credit', 'amountMinor' => -20000]], $tot(80000));
+same('negative line with no item: one balance line', [['description' => 'Invoice #7', 'quantity' => 1, 'unitPrice' => 80000]], $m['lineItems']);
+check('negative line with no item: reason names the line', strpos($m['fallbackReason'], 'Goodwill credit') !== false, $m['fallbackReason']);
+// Part paid: 1,180 invoice, 590 paid, 590 due -> each line at half, tax at half.
+$m = InvoiceMapper::oneTimeLines(7, [$hostLine, $domLine], $tot(118000, 18000, 59000));
+same('part paid: lines scaled to the balance', [47200, 11800], $unit($m));
+same('part paid: descriptions unchanged', ['Hosting Starter plan', 'Domain'], array_column($m['lineItems'], 'description'));
+same('part paid: amount already paid reported', 59000, $m['paidMinor']);
+$b = CheckoutBuilder::build(config(), 7, 'INR', $m, 'payment', 'https://billing.example.com', '', '');
+same('part paid: already-paid amount in metadata', '59000', $b['metadata']['whmcs_already_paid']);
+$m = InvoiceMapper::oneTimeLines(7, [$hostLine, $domLine], $tot(100000, 0, 33333));
+same('part paid, uneven: remainder on the last line', [26666, 6667], $unit($m));
+// Credit applied: WHMCS takes it off total. 1,180 invoice, 180 credit -> total 1,000, balance 1,000.
+$m = InvoiceMapper::oneTimeLines(7, [$hostLine, $domLine], $tot(100000, 18000, 100000, 18000));
+same('credit applied: lines scaled to the balance', [80000, 20000], $unit($m));
+same('credit applied: credit reported, nothing paid', [18000, 0], [$m['creditMinor'], $m['paidMinor']]);
+$b = CheckoutBuilder::build(config(), 7, 'INR', $m, 'payment', 'https://billing.example.com', '', '');
+same('credit applied: credit in metadata', '18000', $b['metadata']['whmcs_credit_applied']);
+// Lines that cannot add up to the invoice total.
+$m = InvoiceMapper::oneTimeLines(7, [$hostLine, $domLine], $tot(125000, 18000));
+same('lines not adding up: one balance line', [125000], $unit($m));
+check('lines not adding up: reason given', $m['fallbackReason'] !== '');
+$m = InvoiceMapper::oneTimeLines(7, [], $tot(50000));
+same('no lines: one balance line', ['Invoice #7'], array_column($m['lineItems'], 'description'));
+same('subtotal is the balance', 50000, $m['subtotal_minor']);
+same('zero-amount lines skipped', [100000], $unit(InvoiceMapper::oneTimeLines(7, [['description' => 'Free addon', 'amountMinor' => 0], ['description' => 'Hosting', 'amountMinor' => 100000]], $tot(100000))));
+throws('nothing due fails', function () use ($tot) {
+    InvoiceMapper::oneTimeLines(7, [], $tot(0));
 }, \RuntimeException::class);
 
 echo "WHMCS tax inside the balance\n";
@@ -171,6 +226,8 @@ $t = InvoiceMapper::taxInBalance(['total' => '1200.00', 'tax' => '100.00', 'tax2
 same('tax + tax2 (CGST + SGST) combined', ['tax_minor' => 20000, 'tax_rate' => 18.0], $t);
 $t = InvoiceMapper::taxInBalance(['total' => '1000.00', 'tax' => '0.00', 'tax2' => '0.00'], 100000, 'INR');
 same('untaxed invoice sends no tax', ['tax_minor' => 0, 'tax_rate' => 0.0], $t);
+$t = InvoiceMapper::taxInBalance(['total' => '1000.00', 'credit' => '180.00', 'tax' => '180.00', 'tax2' => '0', 'taxrate' => '18', 'taxrate2' => '0'], 100000, 'INR');
+same('credit applied: tax share of total + credit (as the lines)', 15254, $t['tax_minor']);
 
 echo "Checkout body\n";
 $mapped = ['lineItems' => [['description' => 'Invoice #9', 'quantity' => 1, 'unitPrice' => 100000]], 'subtotal_minor' => 100000];

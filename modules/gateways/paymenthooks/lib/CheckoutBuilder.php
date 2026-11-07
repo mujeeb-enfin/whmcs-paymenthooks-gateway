@@ -40,7 +40,7 @@ if (!defined('WHMCS')) {
 class CheckoutBuilder
 {
     /**
-     * @param array{lineItems: array, subtotal_minor: int, tax_minor?: int, tax_rate?: float} $mapped from InvoiceMapper
+     * @param array{lineItems: array, subtotal_minor: int, tax_minor?: int, tax_rate?: float, paidMinor?: int, creditMinor?: int} $mapped from InvoiceMapper
      * @param array|null $plan RecurringPlanner::plan() result; required in subscription mode
      * @return array request body
      */
@@ -72,6 +72,13 @@ class CheckoutBuilder
             'whmcs_invoice_id' => (string) $invoiceId,
             'whmcs_system_url' => $systemUrl,
         ];
+        // What already reduced the balance (one-time lines are scaled to it; see InvoiceMapper::oneTimeLines).
+        if ((int) ($mapped['paidMinor'] ?? 0) > 0) {
+            $metadata['whmcs_already_paid'] = (string) (int) $mapped['paidMinor'];
+        }
+        if ((int) ($mapped['creditMinor'] ?? 0) > 0) {
+            $metadata['whmcs_credit_applied'] = (string) (int) $mapped['creditMinor'];
+        }
         if ($mode === 'subscription') {
             $metadata['whmcs_subscribed_items'] = (string) count($plan['subscribed']);
             $metadata['whmcs_subscriptions'] = (string) count($plan['groups']);

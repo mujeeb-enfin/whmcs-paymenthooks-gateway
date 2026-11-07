@@ -81,6 +81,12 @@ function handle_checkout_click(Config $config, Logger $logger, array $params): v
         $client = new Client($config, $logger);
         $currency = WebhookRouter::invoiceCurrency((int) $invoice->userid);
         $mapped = InvoiceMapper::buildLineItems($invoiceId, $currency);
+        // The checkout shows one "Invoice #N" line instead of the invoice's own
+        // lines only when they cannot add up to the balance; record why.
+        if ($mapped['fallbackReason'] !== '') {
+            $logger->info('checkout-single-line', ['invoiceId' => $invoiceId, 'balanceMinor' => $mapped['subtotal_minor']],
+                'Invoice ' . $invoiceId . ' is sent as one "Invoice #' . $invoiceId . '" line: ' . $mapped['fallbackReason'] . '.');
+        }
         // The client chose with the button they pressed; Pay Now is one-time.
         $mode = $config->resolveCheckoutMode((string) ($_POST['mode'] ?? 'payment'));
         $plan = $mode === 'subscription' ? InvoicePlan::forInvoice($invoiceId, $currency) : null;
