@@ -37,6 +37,8 @@ namespace WHMCS\Database {
     {
         public function hasTable(string $t): bool { return true; }
         public function hasColumn(string $t, string $c): bool { return in_array($t, Capsule::$withSubscriptionColumn, true); }
+        public function table(string $t, $fn): void {}
+        public function create(string $t, $fn): void {}
     }
 
     class Query
@@ -210,7 +212,8 @@ namespace {
         if ($cmd === 'GetInvoice') {
             foreach ($t['tblinvoices'] as $inv) {
                 if ($inv['id'] == $args['invoiceid']) {
-                    return ['result' => 'success', 'balance' => $inv['total'] - ($inv['paid'] ?? 0), 'total' => $inv['total']];
+                    return ['result' => 'success', 'balance' => $inv['total'] - ($inv['paid'] ?? 0), 'total' => $inv['total'],
+                        'tax' => $inv['tax'] ?? 0, 'tax2' => 0, 'credit' => $inv['credit'] ?? 0];
                 }
             }
             return ['result' => 'error', 'message' => 'not found'];
@@ -245,9 +248,13 @@ namespace {
     require __DIR__ . '/../modules/gateways/paymenthooks/lib/bootstrap.php';
 
     // Load only the callback's functions (its top-level code bootstraps WHMCS).
+    // The checkout click talks to HarnessClient (tests/harness-mixed-cycles.php)
+    // instead of the network; its redirect is recorded and ends the function
+    // (`exit` becomes `return`, so only terminal redirects are exercised).
     $src = file_get_contents(__DIR__ . '/../modules/gateways/callback/paymenthooks.php');
     $src = substr($src, strpos($src, 'function handle_checkout_click'));
     $src = str_replace('die($body);', 'throw new HarnessResponse($status, $body);', $src);
+    $src = str_replace(['new Client(', 'header(', 'exit;'], ['new \HarnessClient(', 'harness_header(', 'return;'], $src);
     eval('use WHMCS\Database\Capsule; use PaymentHooks\Config; use PaymentHooks\Client; use PaymentHooks\ApiException;'
         . ' use PaymentHooks\Logger; use PaymentHooks\GatewayLog; use PaymentHooks\Signature; use PaymentHooks\Schema;'
         . ' use PaymentHooks\InvoiceMapper; use PaymentHooks\CheckoutBuilder; use PaymentHooks\InvoicePlan;'
@@ -488,6 +495,8 @@ namespace {
     $ev['id'] = 'evt_deleted';
     $st = deliver(json_encode($ev), $secret);
     ok('subscription.deleted unbinds like cancelled', $st === 200 && rows('mod_paymenthooks_subscriptions')[0]['status'] === 'cancelled');
+
+    require __DIR__ . '/harness-mixed-cycles.php';
 
     echo "Refunds made at PaymentHooks\n";
     reset_db();

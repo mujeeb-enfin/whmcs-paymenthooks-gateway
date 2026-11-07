@@ -84,6 +84,10 @@ function handle_checkout_click(Config $config, Logger $logger, array $params): v
         // The client chose with the button they pressed; Pay Now is one-time.
         $mode = $config->resolveCheckoutMode((string) ($_POST['mode'] ?? 'payment'));
         $plan = $mode === 'subscription' ? InvoicePlan::forInvoice($invoiceId, $currency) : null;
+        if ($plan !== null && empty($plan['offer'])) {
+            throw new \RuntimeException('Invoice ' . $invoiceId . ' cannot be subscribed [' . $plan['reasonCode'] . ']: '
+                . $plan['reason'] . ($plan['detail'] !== '' ? ' ' . $plan['detail'] : ''));
+        }
 
         // PaymentHooks has taken (or is taking) a payment whose webhook has not
         // arrived yet: never start a second charge.
@@ -122,13 +126,16 @@ function handle_checkout_click(Config $config, Logger $logger, array $params): v
         if ($sessionId === '' || $url === '') {
             throw new ApiException('PaymentHooks did not return a checkout session id and URL.', 'UNEXPECTED_RESPONSE');
         }
-        // A PaymentHooks API without inline recurring line items ignores
-        // `recurring`: that session would charge once and never renew. Refuse
-        // it (the client is never sent there) instead of guessing a price.
-        if ($mode === 'subscription' && !CheckoutBuilder::recurringAccepted($body['lineItems'], (array) $resp['data'])) {
-            throw new ApiException('PaymentHooks did not accept the recurring line items (lineItems[].recurring) for session '
-                . $sessionId . '; Subscribe & Auto-pay needs a PaymentHooks API with subscription line items. The client can use Pay Now.',
-                'RECURRING_LINE_ITEMS_UNSUPPORTED');
+        // A PaymentHooks API that drops `recurring`, `recurring.startsAt` or
+        // cannot open one subscription per billing group would charge
+        // something other than what the client was shown. Refuse it (the
+        // client is never sent there) instead of guessing.
+        if ($mode === 'subscription') {
+            $problem = CheckoutBuilder::recurringProblem($body['lineItems'], (array) $resp['data']);
+            if ($problem !== '') {
+                throw new ApiException('PaymentHooks did not accept the subscription line items for session ' . $sessionId . ': '
+                    . $problem . '. Subscribe & Auto-pay was refused; the client can use Pay Now.', 'RECURRING_LINE_ITEMS_UNSUPPORTED');
+            }
         }
 
         $now = time();
@@ -137,8 +144,8 @@ function handle_checkout_click(Config $config, Logger $logger, array $params): v
             'session_id' => $sessionId,
             'status'     => 'open',
             'fee_minor'  => (int) ($body['itemConvenienceFeeLocalCurrencyAmount'] ?? 0),
-            // What this checkout subscribes, bound to the subscription on completion.
-            'plan_json'  => $plan ? json_encode(['subscribed' => $plan['subscribed']], JSON_UNESCAPED_SLASHES) : null,
+            // What this checkout subscribes, one group per subscription, bound on completion.
+            'plan_json'  => $plan ? json_encode(['groups' => $plan['groups'], 'subscribed' => $plan['subscribed']], JSON_UNESCAPED_SLASHES) : null,
             'created_at' => $now,
             'updated_at' => $now,
         ]);

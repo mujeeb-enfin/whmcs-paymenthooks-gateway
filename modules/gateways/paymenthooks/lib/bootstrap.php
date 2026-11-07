@@ -19,6 +19,7 @@ require_once __DIR__ . '/EventParser.php';
 require_once __DIR__ . '/CheckoutBuilder.php';
 require_once __DIR__ . '/PriceResolver.php';
 require_once __DIR__ . '/RecurringPlanner.php';
+require_once __DIR__ . '/SubscriptionMatcher.php';
 require_once __DIR__ . '/SubscriptionMap.php';
 require_once __DIR__ . '/InvoicePlan.php';
 require_once __DIR__ . '/PayButton.php';

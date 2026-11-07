@@ -5,6 +5,11 @@
  * renewal invoices on its own. The module only connects the two, it never
  * charges.
  *
+ * Each subscription is routed to its own items only: a monthly hosting
+ * subscription pays the hosting renewal invoice, a yearly domain subscription
+ * the domain renewal invoice; on an invoice holding both, each pays its own
+ * lines' share (share()).
+ *
  * For each subscribed item (service, domain, addon):
  *  1. the oldest Unpaid invoice in the charge currency with a line for it;
  *  2. else, when the item is due (nextduedate within DUE_WINDOW days), WHMCS
@@ -71,11 +76,18 @@ class RenewalInvoice
         return ['invoices' => array_values($found['invoices']), 'missing' => $due, 'alreadyPaid' => $alreadyPaid, 'generated' => $generated];
     }
 
-    /** Oldest unpaid invoice per item, in the currency. */
+    /**
+     * Oldest unpaid invoice per item, in the currency. balanceMinor is the
+     * part of the invoice balance this subscription pays (see share()).
+     */
     private function find(array $items, string $currency): array
     {
         $byItem = [];
         $invoices = [];
+        $ours = [];
+        foreach ($items as $it) {
+            $ours[] = self::key((string) $it->rel_type, (int) $it->rel_id);
+        }
         foreach ($items as $it) {
             $lines = Capsule::table('tblinvoiceitems')
                 ->where('relid', (int) $it->rel_id)
@@ -96,13 +108,70 @@ class RenewalInvoice
                 }
                 $byItem[$it->rel_type . ':' . $it->rel_id] = (int) $inv->id;
                 if (!isset($invoices[(int) $inv->id])) {
-                    $invoices[(int) $inv->id] = ['id' => (int) $inv->id, 'balanceMinor' => InvoiceMapper::balanceMinor((int) $inv->id, $currency)];
+                    $invoiceLines = [];
+                    foreach (Capsule::table('tblinvoiceitems')->where('invoiceid', (int) $inv->id)->get() as $l) {
+                        $invoiceLines[] = ['type' => (string) $l->type, 'relId' => (int) $l->relid,
+                            'amountMinor' => InvoiceMapper::toMinorUnits((float) ($l->amount ?? 0), $currency)];
+                    }
+                    $invoices[(int) $inv->id] = ['id' => (int) $inv->id, 'balanceMinor' => self::share(
+                        $invoiceLines, $ours, InvoiceMapper::toMinorUnits((float) $inv->total, $currency),
+                        InvoiceMapper::balanceMinor((int) $inv->id, $currency)
+                    )];
                 }
                 break;
             }
         }
         ksort($invoices);
         return ['byItem' => $byItem, 'invoices' => $invoices];
+    }
+
+    /** "hosting:77" for a subscribed item; the same key for its invoice lines (lineKey). */
+    public static function key(string $relType, int $relId): string
+    {
+        return $relType . ':' . $relId;
+    }
+
+    /** Item key of an invoice line (promotion lines count for the item they discount), '' for other lines. */
+    public static function lineKey(string $type, int $relId): string
+    {
+        $map = ['Hosting' => 'hosting', 'PromoHosting' => 'hosting', 'Addon' => 'addon', 'PromoDomain' => 'domain'];
+        foreach (InvoicePlan::DOMAIN_TYPES as $t) {
+            $map[$t] = 'domain';
+        }
+        return isset($map[$type]) && $relId > 0 ? self::key($map[$type], $relId) : '';
+    }
+
+    /**
+     * Pure (unit-tested): the part of an invoice's balance one subscription
+     * pays. WHMCS puts items due on the same day on one invoice, so a renewal
+     * invoice can hold a monthly hosting service and a yearly domain that
+     * renew through two subscriptions. With lines of another subscription's
+     * (or a not-subscribed) item on it, this subscription pays its own lines'
+     * share of the invoice total, tax included, never more than the balance
+     * left. Without such lines it pays the whole balance (fees, late fees and
+     * one-off lines included).
+     *
+     * @param array<int, array{type:string, relId:int, amountMinor:int}> $lines all lines of the invoice
+     * @param string[] $ours keys (key()) of the subscription's items
+     */
+    public static function share(array $lines, array $ours, int $totalMinor, int $balanceMinor): int
+    {
+        $mine = 0;
+        $all = 0;
+        $foreign = false;
+        foreach ($lines as $l) {
+            $all += (int) $l['amountMinor'];
+            $k = self::lineKey((string) $l['type'], (int) $l['relId']);
+            if ($k !== '' && in_array($k, $ours, true)) {
+                $mine += (int) $l['amountMinor'];
+            } elseif ($k !== '') {
+                $foreign = true;
+            }
+        }
+        if (!$foreign || $all <= 0) {
+            return $balanceMinor;
+        }
+        return max(0, min($balanceMinor, (int) round($totalMinor * $mine / $all)));
     }
 
     private function isDue(object $it): bool

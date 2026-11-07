@@ -28,6 +28,8 @@ if (!class_exists('WHMCS\\Database\\Capsule')) {
 require_once $lib . 'InvoiceMapper.php';
 require_once $lib . 'RefundMapper.php';
 require_once $lib . 'RecurringPlanner.php';
+require_once $lib . 'SubscriptionMatcher.php';
+require_once $lib . 'RenewalInvoice.php';
 require_once $lib . 'InvoicePlan.php';
 require_once $lib . 'PayButton.php';
 require_once $lib . 'RefundSync.php';
@@ -184,7 +186,8 @@ same('success URL', 'https://billing.example.com/viewinvoice.php?id=9&paymentsuc
 check('no priceId on one-time', !isset($b['metadata']['priceId']) && !array_key_exists('priceId', $b));
 $subPlan = RecurringPlanner::plan([
     ['type' => 'Hosting', 'relType' => 'hosting', 'relId' => 77, 'description' => 'Starter', 'amountMinor' => 100000,
-     'recurring' => ['interval' => 'month', 'intervalCount' => 1, 'renewalMinor' => 100000], 'subscribed' => false],
+     'recurring' => ['interval' => 'month', 'intervalCount' => 1, 'renewalMinor' => 100000], 'subscribed' => false,
+     'periodStart' => date('Y-m-d'), 'lineDueDate' => date('Y-m-d')],
 ], 100000);
 $b = CheckoutBuilder::build(config(), 9, 'INR', $mapped, 'subscription', 'https://billing.example.com', '', '', $subPlan);
 same('subscription sends the plan line with inline recurring', ['interval' => 'month', 'intervalCount' => 1], $b['lineItems'][0]['recurring']);
@@ -286,52 +289,7 @@ foreach ($cycles as $cycle => [$interval, $n]) {
 }
 same('One Time is not recurring', null, PriceResolver::cycleToInterval('One Time'));
 
-echo "Subscribe & Auto-pay plan (mixed invoice)\n";
-// Hosting monthly 1000.00 + its 150.00 setup fee, domain yearly 800.00, addon monthly 200.00.
-$hosting = ['type' => 'Hosting', 'relType' => 'hosting', 'relId' => 77, 'description' => 'Starter Hosting (example.com)', 'amountMinor' => 100000,
-            'recurring' => ['interval' => 'month', 'intervalCount' => 1, 'renewalMinor' => 100000], 'subscribed' => false];
-$setup   = ['type' => 'Setup', 'relType' => '', 'relId' => 77, 'description' => 'Setup Fee', 'amountMinor' => 15000, 'recurring' => null, 'subscribed' => false];
-$domain  = ['type' => 'DomainRegister', 'relType' => 'domain', 'relId' => 12, 'description' => 'Domain Registration - example.com - 1 Year/s', 'amountMinor' => 80000,
-            'recurring' => ['interval' => 'year', 'intervalCount' => 1, 'renewalMinor' => 80000], 'subscribed' => false];
-$addon   = ['type' => 'Addon', 'relType' => 'addon', 'relId' => 5, 'description' => 'Backups', 'amountMinor' => 20000,
-            'recurring' => ['interval' => 'month', 'intervalCount' => 1, 'renewalMinor' => 20000], 'subscribed' => false];
-$p = RecurringPlanner::plan([$hosting, $setup, $domain, $addon], 215000);
-same('mixed: offered', true, $p['offer']);
-same('mixed: cadence anchored on the hosting service', ['month', 1], [$p['interval'], $p['intervalCount']]);
-same('mixed: hosting and addon subscribed', [['hosting', 77], ['addon', 5]], array_map(function ($i) { return [$i['relType'], $i['relId']]; }, $p['subscribed']));
-same('mixed: renews at hosting + addon', 120000, $p['renewalMinor']);
-same('mixed: lines add up to the balance', 215000, array_sum(array_column($p['lineItems'], 'unitPrice')));
-same('mixed: recurring lines', 2, count(array_filter($p['lineItems'], function ($l) { return isset($l['recurring']); })));
-same('mixed: setup fee is one-time', 15000, $p['lineItems'][1]['unitPrice']);
-check('mixed: setup fee has no recurring', !isset($p['lineItems'][1]['recurring']));
-check('mixed: yearly domain charged once with the reason', strpos($p['oneTime'][1]['note'] ?? '', 'every year') !== false, json_encode($p['oneTime']));
-$p = RecurringPlanner::plan([$domain], 80000);
-same('domain only: subscribed yearly', ['year', 1, 'domain'], [$p['interval'], $p['intervalCount'], $p['subscribed'][0]['relType'] ?? '']);
-$twoYear = ['recurring' => ['interval' => 'year', 'intervalCount' => 2, 'renewalMinor' => 160000], 'amountMinor' => 160000] + $domain;
-$p = RecurringPlanner::plan([$twoYear], 160000);
-same('2-year domain renews every 2 years', ['year', 2], [$p['interval'], $p['intervalCount']]);
-$p = RecurringPlanner::plan([['recurring' => ['interval' => 'month', 'intervalCount' => 12, 'renewalMinor' => 80000]] + $domain,
-    ['recurring' => ['interval' => 'year', 'intervalCount' => 1, 'renewalMinor' => 20000]] + $addon], 100000);
-same('12 months and 1 year share one subscription', 2, count($p['subscribed']));
-$promo = ['amountMinor' => 50000] + $hosting;
-$p = RecurringPlanner::plan([$promo, $addon], 70000);
-same('discounted first month: hosting not subscribed, addon is', [['addon', 5]], array_map(function ($i) { return [$i['relType'], $i['relId']]; }, $p['subscribed']));
-check('discounted first month: reason shown', strpos($p['oneTime'][0]['note'], 'discounted') !== false);
-$premium = ['amountMinor' => 120000] + $hosting;
-$p = RecurringPlanner::plan([$premium], 120000);
-same('first period above renewal: renewal + one-time difference', [100000, 20000], array_column($p['lineItems'], 'unitPrice'));
-$p = RecurringPlanner::plan([$hosting, $setup], 100000);
-same('part-paid invoice: not offered', false, $p['offer']);
-check('part-paid invoice: says why', strpos($p['reason'], 'balance') !== false);
-same('part-paid invoice: no line items', [], $p['lineItems']);
-$p = RecurringPlanner::plan([['subscribed' => true] + $hosting], 100000);
-same('already subscribed: not offered', false, $p['offer']);
-$p = RecurringPlanner::plan([$setup], 15000);
-same('no recurring item: not offered', false, $p['offer']);
-$p = RecurringPlanner::plan([$hosting, ['type' => 'PromoHosting', 'relType' => '', 'relId' => 77, 'description' => 'Promo', 'amountMinor' => -10000, 'recurring' => null, 'subscribed' => false]], 90000);
-same('negative promo line: not offered', false, $p['offer']);
-same('cadence labels', ['every month', 'every 3 months', 'every 2 years'],
-    [RecurringPlanner::cadenceLabel('month', 1), RecurringPlanner::cadenceLabel('month', 3), RecurringPlanner::cadenceLabel('year', 2)]);
+require __DIR__ . '/recurring-tests.php';
 
 echo "WHMCS exclusive tax spread over the lines\n";
 $rows = [['amountMinor' => 100000, 'taxed' => true, 'recurring' => ['interval' => 'month', 'intervalCount' => 1, 'renewalMinor' => 100000]],
@@ -346,32 +304,6 @@ $odd = InvoicePlan::allocateTax([['amountMinor' => 333, 'taxed' => true, 'recurr
 same('rounding remainder on the last taxed line', 1100, array_sum(array_column($odd, 'amountMinor')));
 same('invoice-item types per subscribed item', [['Hosting'], ['Addon'], ['Domain', 'DomainRegister', 'DomainTransfer']],
     [InvoicePlan::itemTypes('hosting'), InvoicePlan::itemTypes('addon'), InvoicePlan::itemTypes('domain')]);
-
-echo "Pay buttons\n";
-$tpl = (string) file_get_contents(__DIR__ . '/../modules/gateways/paymenthooks/templates/pay_button.tpl');
-$view = ['actionUrl' => 'https://billing.example.com/modules/gateways/callback/paymenthooks.php', 'invoiceId' => 1001, 'payText' => 'Pay Now', 'currency' => 'INR'];
-$html = PayButton::render($tpl, $view);
-check('one button without a plan', substr_count($html, 'type="submit"') === 1 && strpos($html, 'paymenthooks_pay_submit') !== false);
-check('Pay Now posts mode=payment', strpos($html, 'name="mode" value="payment"') !== false);
-check('no Subscribe button without a plan', strpos($html, 'paymenthooks_pay_subscribe') === false);
-check('no placeholder left', strpos($html, '{') === false, $html);
-$html = PayButton::render($tpl, $view + ['plan' => RecurringPlanner::plan([$setup], 15000)]);
-check('no Subscribe button when nothing can renew', strpos($html, 'paymenthooks_pay_subscribe') === false);
-$mixed = RecurringPlanner::plan([$hosting, $setup, $domain, $addon], 215000);
-$html = PayButton::render($tpl, $view + ['plan' => $mixed]);
-check('two buttons with a plan', substr_count($html, 'type="submit"') === 2);
-check('Subscribe posts mode=subscription', strpos($html, 'id="paymenthooks_pay_subscribe"') !== false && strpos($html, 'name="mode" value="subscription"') !== false);
-check('default Subscribe label', strpos($html, '>Subscribe &amp; Auto-pay</button>') !== false);
-check('Subscribe button described by the summary', strpos($html, 'aria-describedby="paymenthooks_pay_subscribe_summary"') !== false
-    && strpos($html, 'id="paymenthooks_pay_subscribe_summary"') !== false);
-check('summary states cadence and renewal total', strpos($html, 'every month for 1,200.00 INR') !== false, $html);
-check('summary lists the subscribed items', strpos($html, 'paymenthooks_pay_subscribe_item_1') !== false && strpos($html, 'Backups (200.00 INR)') !== false);
-check('summary lists the yearly domain as charged once, with why', strpos($html, 'paymenthooks_pay_subscribe_once_item_') !== false && strpos($html, 'Domain Registration') !== false);
-$html = PayButton::render($tpl, $view + ['plan' => $mixed, 'subscribeText' => '<b>x</b>', 'heading' => 'Pay "now"']);
-check('labels and heading escaped', strpos($html, '<b>x</b>') === false && strpos($html, '&lt;b&gt;x&lt;/b&gt;') !== false && strpos($html, 'Pay &quot;now&quot;') !== false);
-preg_match_all('/<(div|ul|li|button|form|input|img)\b(?![^>]*\bid=)[^>]*>/', $html, $noId);
-same('every element has a paymenthooks_ id', [], $noId[0]);
-same('money formatting', ['1,200.00 INR', '1,500 JPY'], [PayButton::money(120000, 'INR'), PayButton::money(1500, 'JPY')]);
 
 echo "Renewal split and refunds from PaymentHooks\n";
 same('charge split over renewal invoices oldest first', [2001 => 100000, 2002 => 20000],

@@ -117,25 +117,59 @@ class WebhookRouter
             ->where('session_id', $s['sessionId'])
             ->update($update);
 
-        if ($s['subscriptionId'] !== '') {
-            $this->bindSubscription($s['invoiceId'], $s['sessionId'], $s['subscriptionId'], $s['currency']);
+        if ($s['subscriptionId'] !== '' || $s['subscriptions']) {
+            $this->bindSubscriptions($s, $applied);
         }
         return true;
     }
 
     /**
-     * Binds the subscription to every item the checkout subscribed (the plan
-     * stored with the session when it was created). Sessions opened by earlier
-     * module versions have no plan and subscribed only the first service.
+     * Binds each subscription the checkout opened to the items of its billing
+     * group (the plan stored with the session when it was created). One
+     * group: the session's `subscription`. Several groups: matched through
+     * the session's `subscriptions` list (SubscriptionMatcher); a group that
+     * cannot be matched is left unbound and flagged. Sessions opened by
+     * earlier module versions store only `subscribed` (one subscription), or
+     * no plan at all (the first service).
      */
-    private function bindSubscription(int $invoiceId, string $sessionId, string $subscriptionId, string $currency): void
+    private function bindSubscriptions(array $s, array $applied): void
     {
-        $planJson = (string) Capsule::table('mod_paymenthooks_sessions')->where('session_id', $sessionId)->value('plan_json');
+        $invoiceId = $s['invoiceId'];
+        $currency = $s['currency'];
+        $planJson = (string) Capsule::table('mod_paymenthooks_sessions')->where('session_id', $s['sessionId'])->value('plan_json');
         $plan = $planJson !== '' ? json_decode($planJson, true) : null;
-        if (is_array($plan) && !empty($plan['subscribed'])) {
-            SubscriptionMap::bind($subscriptionId, $invoiceId, $currency, $plan['subscribed']);
+        $groups = is_array($plan) && is_array($plan['groups'] ?? null) ? $plan['groups'] : [];
+
+        if (count($groups) > 1 || ($groups && $s['subscriptions'] && count($s['subscriptions']) > 1)) {
+            $result = SubscriptionMatcher::match($groups, $s['subscriptions']);
+            $bound = [];
+            foreach ($result['matched'] as $g => $subscriptionId) {
+                SubscriptionMap::bind($subscriptionId, $invoiceId, $currency, $groups[$g]['items']);
+                $bound[] = $subscriptionId . ' (' . SubscriptionSync::describeGroup($groups[$g]) . ')';
+            }
+            if ($result['unmatched'] || $result['unused']) {
+                $missing = array_map(static function ($g) use ($groups) {
+                    return SubscriptionSync::describeGroup($groups[$g]);
+                }, $result['unmatched']);
+                $note = 'Payment applied to invoice ' . $invoiceId . '. Bound ' . ($bound ? implode('; ', $bound) : 'no subscription') . '. '
+                    . ($missing ? 'Could not tell which subscription renews ' . implode('; ', $missing) . '; ' : '')
+                    . ($result['unused'] ? 'subscriptions not bound: ' . implode(', ', $result['unused']) . '; ' : '')
+                    . 'their renewals will not be recorded until bound. Check the subscriptions in PaymentHooks.';
+                $this->logger->error('webhook-subscriptions-unmatched', $applied + ['groups' => count($groups), 'subscriptions' => count($s['subscriptions'])], $note);
+                $this->log->set(GatewayLog::NEEDS_ATTENTION, $note, $applied);
+                return;
+            }
+            $this->log->set($this->log->status(), $this->log->note() . ' Auto-pay: ' . implode('; ', $bound) . '.', $applied);
             return;
         }
+
+        $subscriptionId = $s['subscriptionId'] !== '' ? $s['subscriptionId'] : (string) ($s['subscriptions'][0]['id'] ?? '');
+        $items = $groups ? $groups[0]['items'] : (is_array($plan) && !empty($plan['subscribed']) ? $plan['subscribed'] : []);
+        if ($items) {
+            SubscriptionMap::bind($subscriptionId, $invoiceId, $currency, $items);
+            return;
+        }
+        // Sessions opened by module versions before 3.1.0: the first service.
         $serviceId = PriceResolver::firstRecurringServiceId($invoiceId);
         if ($serviceId <= 0) {
             $this->logger->error('webhook-subscription-unbound', ['invoiceId' => $invoiceId, 'subscriptionId' => $subscriptionId],

@@ -192,6 +192,16 @@ class SubscriptionSync
             . ' no longer auto-renews. WHMCS raises the next renewal invoice for the client to pay.', ['subscriptionId' => $subscriptionId]);
     }
 
+    /** "every year from 2027-11-07: domain 12" (a planned billing group) */
+    public static function describeGroup(array $group): string
+    {
+        $items = array_map(static function ($it) {
+            return (object) ['rel_type' => $it['relType'], 'rel_id' => $it['relId']];
+        }, $group['items']);
+        return RecurringPlanner::cadenceLabel((string) $group['interval'], (int) $group['intervalCount'])
+            . (!empty($group['startsAt']) ? ' from ' . $group['startsAt'] : '') . ': ' . self::describe($items);
+    }
+
     /** "hosting 77, domain 12" */
     public static function describe(array $items): string
     {

@@ -192,12 +192,25 @@ function paymenthooks_link($params)
     $currency  = strtoupper((string) ($params['currency'] ?? ''));
 
     $plan = null;
-    if ($config->subscriptionsEnabled && $currency !== '') {
+    $planError = false;
+    if ($config->subscriptionsEnabled) {
+        $logger = new Logger('paymenthooks', $config->logging);
         try {
+            if ($currency === '') {
+                throw new \RuntimeException('The invoice has no currency code.');
+            }
             $plan = InvoicePlan::forInvoice($invoiceId, $currency);
         } catch (\Throwable $e) {
-            // Pay Now still works; the reason the Subscribe button is missing is logged.
-            (new Logger('paymenthooks', $config->logging))->error('subscribe-plan', ['invoice_id' => $invoiceId], get_class($e) . ': ' . $e->getMessage());
+            // Pay Now still works; the client sees that auto-pay is unavailable right now.
+            $planError = true;
+            $logger->error('subscribe-plan', ['invoice_id' => $invoiceId], get_class($e) . ': ' . $e->getMessage());
+        }
+        // Once per invoice view: WHMCS can call _link more than once while rendering a page.
+        static $logged = [];
+        if ($plan !== null && empty($plan['offer']) && !isset($logged[$invoiceId])) {
+            $logged[$invoiceId] = true;
+            $logger->info('subscribe-unavailable', ['invoice_id' => $invoiceId, 'reason' => $plan['reasonCode'], 'detail' => $plan['detail']],
+                'Subscribe & Auto-pay not offered on invoice ' . $invoiceId . ': ' . $plan['reason']);
         }
     }
 
@@ -216,6 +229,7 @@ function paymenthooks_link($params)
         'blurb'         => (string) ($params['checkoutBlurb'] ?? ''),
         'currency'      => $currency,
         'plan'          => $plan,
+        'planError'     => $planError,
     ]);
 }
 

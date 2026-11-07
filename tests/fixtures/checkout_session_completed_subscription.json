@@ -29,6 +29,7 @@
       },
       "payment_intent": "ph_pay_whmcs_2",
       "subscription": "ph_sub_whmcs_1",
+      "subscriptions": [],
       "success_url": null,
       "cancel_url": null,
       "url": "https://paymenthooks.com/checkout/cs_whmcs_2",

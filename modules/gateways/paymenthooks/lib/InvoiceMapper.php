@@ -108,6 +108,24 @@ class InvoiceMapper
         return self::toMinorUnits((float) self::getInvoice($invoiceId)['balance'], $currency);
     }
 
+    /**
+     * The balance with what reduced it: account credit applied and payments
+     * already made, all in minor units. GetInvoice `credit` is the credit
+     * applied (WHMCS takes it off `total`); payments are `total - balance`.
+     *
+     * @return array{balanceMinor:int, creditMinor:int, paidMinor:int}
+     */
+    public static function balanceDetail(int $invoiceId, string $currency): array
+    {
+        $inv = self::getInvoice($invoiceId);
+        $balance = self::toMinorUnits((float) $inv['balance'], $currency);
+        return [
+            'balanceMinor' => $balance,
+            'creditMinor'  => self::toMinorUnits((float) ($inv['credit'] ?? 0), $currency),
+            'paidMinor'    => max(0, self::toMinorUnits((float) ($inv['total'] ?? 0), $currency) - $balance),
+        ];
+    }
+
     /** @return array<string, mixed> WHMCS GetInvoice result */
     private static function getInvoice(int $invoiceId): array
     {

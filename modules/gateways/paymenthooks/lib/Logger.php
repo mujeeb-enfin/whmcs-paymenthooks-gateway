@@ -42,6 +42,18 @@ class Logger
         }
     }
 
+    /**
+     * Always recorded, not an error: Module Log plus an Activity Log line
+     * prefixed "PaymentHooks info", e.g. why an invoice is not offered
+     * Subscribe & Auto-pay.
+     */
+    public function info(string $action, $request, string $message): void
+    {
+        logModuleCall($this->gateway, $action, $request, $message, '', []);
+        $context = is_string($request) ? $request : (string) json_encode($request, JSON_UNESCAPED_SLASHES);
+        logActivity(substr('PaymentHooks info [' . $action . ']: ' . $message . ' | ' . $context, 0, 2000));
+    }
+
     /** Always recorded: Activity Log plus Module Log. */
     public function error(string $action, $request, $response, array $replace = []): void
     {

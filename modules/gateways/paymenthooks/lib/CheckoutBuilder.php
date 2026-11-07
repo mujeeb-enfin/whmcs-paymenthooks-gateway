@@ -8,11 +8,16 @@
  *                     minor units of itemLocalCurrency
  *   itemLocalCurrency required ISO code, upper case; amounts stay in this currency
  *   mode              "payment" | "subscription"
- *   lineItems[].recurring { interval, intervalCount }
+ *   lineItems[].recurring { interval, intervalCount, startsAt? }
  *                     subscription mode only: the line renews at its unitPrice
  *                     on that cadence; lines without it are charged once on the
- *                     first invoice (setup fees, other-cycle items). Every
- *                     recurring line of one session shares one cadence.
+ *                     first payment (setup fees, a discounted first period).
+ *                     Without startsAt the line is also charged now (its first
+ *                     period); with startsAt (ISO date) it is first charged on
+ *                     that date. PaymentHooks groups recurring lines by
+ *                     (interval, intervalCount, startsAt): one subscription per
+ *                     group, one payment now, one mandate. The session returns
+ *                     them as `subscriptions: [...]` next to `subscription`.
  *   itemConvenienceFeeLocalCurrencyAmount
  *                     integer minor units, added to the total by the server
  *   itemTaxLocalCurrencyAmount + taxBehavior "inclusive"
@@ -69,6 +74,7 @@ class CheckoutBuilder
         ];
         if ($mode === 'subscription') {
             $metadata['whmcs_subscribed_items'] = (string) count($plan['subscribed']);
+            $metadata['whmcs_subscriptions'] = (string) count($plan['groups']);
         }
 
         $body = [
@@ -107,30 +113,53 @@ class CheckoutBuilder
         return $body;
     }
 
-    /**
-     * True when PaymentHooks kept every `recurring` the request sent (the
-     * created session echoes its line items). An API without inline recurring
-     * line items drops the field; that session would charge once and never
-     * renew, so the caller must refuse it instead of redirecting the client.
-     */
+    /** True when the created session kept every `recurring` (see recurringProblem). */
     public static function recurringAccepted(array $sentLineItems, array $session): bool
     {
+        return self::recurringProblem($sentLineItems, $session) === '';
+    }
+
+    /**
+     * Why the created session cannot be used for Subscribe & Auto-pay, or ''.
+     * The session echoes its line items: an API without inline recurring
+     * line items drops `recurring`, one without start dates drops `startsAt`
+     * (it would charge a discounted item's renewal price now), and one that
+     * cannot open several subscriptions has no `subscriptions` list. Each of
+     * those sessions would charge something other than what the client was
+     * shown, so the caller refuses it instead of redirecting the client.
+     */
+    public static function recurringProblem(array $sentLineItems, array $session): string
+    {
+        if (($session['mode'] ?? '') !== 'subscription') {
+            return 'the session is not in subscription mode';
+        }
         $echoed = $session['lineItems'] ?? null;
         if (!is_array($echoed) || count($echoed) !== count($sentLineItems)) {
-            return false;
+            return 'the session did not return the line items sent';
         }
+        $cadences = [];
         foreach ($sentLineItems as $i => $sent) {
             if (!isset($sent['recurring'])) {
                 continue;
             }
+            $r = $sent['recurring'];
             $got = $echoed[$i]['recurring'] ?? null;
             if (!is_array($got)
-                || ($got['interval'] ?? '') !== $sent['recurring']['interval']
-                || (int) ($got['intervalCount'] ?? 1) !== (int) $sent['recurring']['intervalCount']) {
-                return false;
+                || ($got['interval'] ?? '') !== $r['interval']
+                || (int) ($got['intervalCount'] ?? 1) !== (int) $r['intervalCount']) {
+                return 'lineItems[' . $i . '].recurring was not kept (inline recurring line items unsupported)';
             }
+            $startsAt = (string) ($r['startsAt'] ?? '');
+            if ($startsAt !== '' && substr((string) ($got['startsAt'] ?? ''), 0, 10) !== $startsAt) {
+                return 'lineItems[' . $i . '].recurring.startsAt ' . $startsAt . ' was not kept (recurring start dates unsupported)';
+            }
+            $cadences[$r['interval'] . ':' . $r['intervalCount'] . ':' . $startsAt] = true;
         }
-        return ($session['mode'] ?? '') === 'subscription';
+        if (count($cadences) > 1 && !is_array($session['subscriptions'] ?? null)) {
+            return 'the session has ' . count($cadences) . ' billing groups but returned no subscriptions list '
+                . '(several subscriptions in one checkout unsupported)';
+        }
+        return '';
     }
 
     /**

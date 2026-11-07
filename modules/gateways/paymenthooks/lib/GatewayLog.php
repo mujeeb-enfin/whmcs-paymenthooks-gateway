@@ -47,6 +47,11 @@ class GatewayLog
         return $this->status;
     }
 
+    public function note(): string
+    {
+        return $this->note;
+    }
+
     /** Writes the entry. $base identifies the delivery (event id, type, ...). */
     public function write(string $gateway, array $base, array $secrets = []): void
     {

@@ -46,6 +46,7 @@ renewal, and tells WHMCS by webhook.
    modules/gateways/paymenthooks/lib/RefundMapper.php     refund amount in USD cents
    modules/gateways/paymenthooks/lib/PriceResolver.php    billing cycle to interval
    modules/gateways/paymenthooks/lib/RecurringPlanner.php what Subscribe & Auto-pay subscribes and charges once
+   modules/gateways/paymenthooks/lib/SubscriptionMatcher.php subscriptions of one checkout to their items
    modules/gateways/paymenthooks/lib/InvoicePlan.php      reads an invoice's hosting, domains and addons
    modules/gateways/paymenthooks/lib/PayButton.php        Pay Now and Subscribe buttons
    modules/gateways/paymenthooks/lib/SubscriptionMap.php  subscription to services, domains and addons
@@ -81,6 +82,24 @@ are kept. Tables are upgraded automatically on the next request:
 | `mod_paymenthooks_refunds` | Refunds known per payment, so none is booked twice | new table |
 | `mod_paymenthooks_price_map` | Earlier versions' product/price cache; no longer written | `currency`, `amount_minor` |
 | `mod_paymenthooks_install` | A random id for this install, used in idempotency keys | new table |
+
+### Discounted first periods and mixed cycles (3.1.0 to 3.1.1)
+
+Replace all files; there is no table change (`plan_json` now also stores the billing groups). What changes
+for clients and admins:
+
+- **Discounted first period** (first-year domain price, promotion month): Subscribe & Auto-pay is now
+  offered. This period is charged once at its actual price and the item renews at its full price from its
+  next due date (`recurring.startsAt`). 3.1.0 showed only Pay Now on such invoices.
+- **Mixed cycles** (monthly hosting + yearly domain): every recurring item is subscribed in one checkout,
+  one subscription per billing group, one payment now. 3.1.0 charged the other cycle once and left it to
+  its renewal invoice.
+- **A note under Pay Now** (`paymenthooks_pay_subscribe_unavailable`) says why Subscribe is not offered;
+  the reason is also in the Activity Log (`PaymentHooks info [subscribe-unavailable]`).
+- **Requires** a PaymentHooks API that keeps `lineItems[].recurring.startsAt` and returns `subscriptions`
+  for a checkout with several billing groups. Without it Subscribe is refused with
+  `RECURRING_LINE_ITEMS_UNSUPPORTED` (logged, the client is not charged) and Pay Now still works.
+- Subscriptions bound by 3.1.0 keep renewing unchanged.
 
 ### Subscribe & Auto-pay (3.1.0)
 
@@ -239,10 +258,34 @@ each charge on the WHMCS renewal invoice. The module has no capture function and
 ### Subscribe & Auto-pay
 
 With **Enable Subscriptions** ticked, invoices with hosting, domains or addons show **Subscribe & Auto-pay**
-next to **Pay Now**. Under the buttons the client sees what will renew, at what price and how often, and what
-is charged once. Pay Now always pays the invoice once.
+next to **Pay Now**. Under the buttons the client sees what is paid now and, for each subscription, what renews,
+at what price, how often and from when, for example:
 
-What one subscription covers (a subscription has one billing cycle):
+> With Subscribe & Auto-pay you pay **₹1,350.25** now, then until you cancel:
+> ₹1,532.82 every year from 7 Nov 2027: Domain Registration - taptipm.com (₹1,532.82)
+
+Pay Now always pays the invoice once.
+
+When Subscribe is not offered, a short note under Pay Now (`paymenthooks_pay_subscribe_unavailable`) says
+why, and the reason is written once per invoice view to the Activity Log as
+`PaymentHooks info [subscribe-unavailable]`. If the invoice could not be read, the note says "Auto-pay is
+unavailable for this invoice right now" and the error is logged as `PaymentHooks error [subscribe-plan]`.
+With Enable Subscriptions off there is no button and no note.
+
+| Reason code (log) | Note shown |
+|---|---|
+| `part_paid` | Part of this invoice has already been paid ... auto-pay can start from the next renewal invoice. |
+| `credit_applied` | Account credit was applied to this invoice ... |
+| `lines_mismatch` | The invoice lines do not add up to the amount due ... |
+| `negative_line` | A discount or credit line that is not tied to an item. |
+| `free_renewal` | The items renew free of charge. |
+| `already_subscribed` | The items already renew automatically. |
+| `nothing_recurring` | Nothing on the invoice renews. |
+| `cycle_unsupported` | The billing cycle cannot renew automatically. |
+| `period_ended`, `due_date_changed`, `no_due_date` | A discounted item whose period dates cannot be worked out reliably; auto-pay can start from its next renewal invoice. |
+| `mixed` | Different items are ineligible for different reasons. |
+
+What each subscription covers (a subscription has one billing cycle and one start date):
 
 | Invoice line | Renews at | How often |
 |---|---|---|
@@ -251,48 +294,76 @@ What one subscription covers (a subscription has one billing cycle):
 | Addon (`tblhostingaddons`) | the addon's recurring amount | its billing cycle |
 | Setup fee, one-off item, late fee | charged once | - |
 
-- **Mixed cycles.** Items whose cycle matches the **first hosting service** (or, without hosting, the first
-  recurring item) are subscribed together. Items on another cycle, typically a yearly domain next to monthly
-  hosting, are charged once on the same checkout; the page says so. Their next WHMCS renewal invoice shows
-  Subscribe & Auto-pay again, so the client can put them on their own subscription. One checkout never opens
-  two subscriptions: a client paying once should see one charge.
-- **First period above renewal** (setup fee folded into the line, registration dearer than renewal): the item
-  renews at its renewal price and the difference is a one-time line on the first payment.
-- **First period below renewal** (promotion, first-year discount): the item is charged once and can be
-  subscribed from its first full-price renewal invoice, so the client is never charged more than shown.
+- **Every recurring item, one checkout.** All eligible hosting, domains and addons on the invoice are
+  subscribed together. PaymentHooks groups the recurring lines by billing cycle and start date and opens one
+  subscription per group, with one payment now and one mandate: monthly hosting and a yearly domain become a
+  monthly and a yearly subscription. 12 months and 1 year are one cycle.
+- **Full price** (this period costs the renewal price): the line is sent at its renewal price without a start
+  date, so the subscription's first charge, today, pays this period and the first renewal is one cycle later.
+  A first period dearer than renewal (setup fee folded in, registration above renewal) adds the difference as
+  a one-time line. A renewal invoice paid **before** its due date is charged once now and its subscription
+  starts on the next due date, so renewals stay on WHMCS's due dates.
+- **Discounted first period** (first-year domain price, promotion): this period's actual amount, with its tax,
+  is a one-time line, and the item is a recurring line at its renewal price with `recurring.startsAt` = the
+  day this period ends. A `PromoHosting` / `PromoDomain` line is counted with the item it discounts.
+- **Start date source.** `startsAt` is the item's next due date after this invoice is paid:
+  `tblhosting.nextduedate`, `tbldomains.nextduedate` or `tblhostingaddons.nextduedate`, plus one cycle (the
+  domain's registration period). Until the invoice is paid WHMCS keeps that column on the first day of the
+  period being paid, which equals the invoice line's `duedate` (for a new order or registration: the order
+  date); on payment WHMCS moves it on by one cycle, to `startsAt`. If WHMCS already moved it on, the module
+  uses it as is. If the dates disagree otherwise (a due date edited by hand), the period has already ended,
+  or there is no due date, the discounted item is not guessed: Subscribe is not offered and the note says why.
+  A month-end date clamps (31 Jan + 1 month = 28/29 Feb).
 - **Not offered** when the invoice is part-paid or has credit applied (the lines no longer add up to the
-  balance), has a negative promo line, or every recurring item already auto-renews.
+  balance), has a negative line not tied to an item, or every recurring item already auto-renews or renews
+  free; see the reasons above.
 - WHMCS tax is included: exclusive tax is spread over the taxed lines and each renewal price carries its
-  share; PaymentHooks never adds tax on top.
+  share at the same rate; PaymentHooks never adds tax on top.
 
-The checkout session is created with `mode: "subscription"` and inline recurring line items:
+The checkout session is created with `mode: "subscription"` and inline recurring line items. Hosting monthly
+with a setup fee, a domain at a first-year price of 500.00 (renews at 800.00) and an addon:
 
 ```json
 "lineItems": [
   { "description": "Starter Hosting", "quantity": 1, "unitPrice": 100000, "recurring": { "interval": "month", "intervalCount": 1 } },
-  { "description": "Backups",         "quantity": 1, "unitPrice": 20000,  "recurring": { "interval": "month", "intervalCount": 1 } },
   { "description": "Setup Fee",       "quantity": 1, "unitPrice": 15000 },
-  { "description": "Domain Registration - example.com - 1 Year/s", "quantity": 1, "unitPrice": 80000 }
+  { "description": "Domain Registration - example.com - 1 Year/s", "quantity": 1, "unitPrice": 80000,
+    "recurring": { "interval": "year", "intervalCount": 1, "startsAt": "2027-11-07" } },
+  { "description": "This period: Domain Registration - example.com - 1 Year/s", "quantity": 1, "unitPrice": 50000 },
+  { "description": "Backups",         "quantity": 1, "unitPrice": 20000,  "recurring": { "interval": "month", "intervalCount": 1 } }
 ]
 ```
 
-The module checks that the created session kept every `recurring`. A PaymentHooks API without inline
-recurring line items would drop them and charge once without renewing, so the module refuses that session
-(`RECURRING_LINE_ITEMS_UNSUPPORTED`, logged) and the client can still use Pay Now.
+Charged now: 1,000.00 + 150.00 + 500.00 + 200.00 = the invoice balance. Then 1,200.00 every month from next
+month (hosting + addon) and 800.00 every year from 2027-11-07 (domain).
+
+The module checks the created session before sending the client to it, and refuses it
+(`RECURRING_LINE_ITEMS_UNSUPPORTED`, Gateway Log `Checkout Error`, Activity Log `[checkout-click]`, nothing is
+charged) when PaymentHooks did not keep a `recurring`, did not keep a `startsAt`, or returned no `subscriptions`
+list for a checkout with more than one billing group. The client can still use Pay Now.
 
 ### Binding
 
-On `checkout.session.completed` the subscription is bound to every item it covers, in
-`mod_paymenthooks_subscriptions`, and the id is copied to the item's `subscriptionid` column where WHMCS has
+On `checkout.session.completed` each subscription is bound to the items of its billing group, in
+`mod_paymenthooks_subscriptions`, and its id is copied to the item's `subscriptionid` column where WHMCS has
 one (always `tblhosting`; `tbldomains` and `tblhostingaddons` when your WHMCS version has it). Admins see it
 on the service, and **Cancel Subscription** / cancelling the service cancels it at PaymentHooks.
+
+With one group, the session's `subscription` is used. With several, the event's `subscriptions` list is
+matched to the groups by billing cycle, start date (`starts_at`, else the next charge date) and, when listed,
+the items and prices. A group is bound only to a single matching subscription; anything ambiguous or missing
+is left unbound and the delivery is logged `Needs Attention` (`webhook-subscriptions-unmatched`) with what to
+check. The payment itself is always recorded.
 
 ### Renewals
 
 1. PaymentHooks charges the renewal and sends `subscription.renewed` and `invoice.paid` (the same payment id;
    the second is a `Duplicate`).
-2. The module finds the oldest Unpaid invoice in the charge currency for each subscribed item. One invoice
-   for all of them, or one per item, both work; the charge is spread over them oldest first.
+2. The module finds the oldest Unpaid invoice in the charge currency for each item **of that subscription
+   only**: the monthly subscription pays the hosting renewal invoice, the yearly one the domain renewal
+   invoice. One invoice for all of them, or one per item, both work; the charge is spread over them oldest
+   first. When WHMCS put items of two subscriptions on one invoice (same due date), each subscription pays its
+   own lines' share of that invoice, tax included.
 3. **No renewal invoice yet.** If the item is due (its next due date is within 7 days), the module asks WHMCS
    to raise it now (`localAPI GenInvoices` for exactly those items, without emails), with WHMCS's own pricing,
    tax and numbering, then records the charge. If WHMCS still raises none, the event is redelivered
@@ -366,8 +437,9 @@ Secrets are masked in every log.
 | "Online payment is unavailable" on the invoice | A setting is missing or invalid; see the Activity Log. |
 | `Checkout Error` | The reason is in the entry; `INSUFFICIENT_SCOPE` means the key lacks a scope. |
 | Renewal `Retry Requested` | The item is due but WHMCS raised no renewal invoice for it (check the product's invoice generation and that the item is Active). |
-| No Subscribe button | Enable Subscriptions is off, nothing on the invoice can renew, or the lines do not add up to the balance (part payment, credit); the reason is in the Activity Log when the plan could not be read. |
-| `RECURRING_LINE_ITEMS_UNSUPPORTED` | Your PaymentHooks API does not accept `lineItems[].recurring` yet; clients can use Pay Now. |
+| No Subscribe button | With Enable Subscriptions on, the note under Pay Now says why, and the Activity Log has `PaymentHooks info [subscribe-unavailable]` with the reason code (or `[subscribe-plan]` when the invoice could not be read). No note: Enable Subscriptions is off. |
+| `RECURRING_LINE_ITEMS_UNSUPPORTED` | Your PaymentHooks API did not keep `lineItems[].recurring`, `recurring.startsAt`, or return `subscriptions` for several billing groups; the entry says which. Clients can use Pay Now. |
+| Completed checkout `Needs Attention` with `webhook-subscriptions-unmatched` | The payment is recorded but a billing group could not be matched to one subscription; check the subscriptions in PaymentHooks. |
 | `Needs Attention` | Read the entry; it says what to record by hand. |
 
 ## Tests
@@ -375,8 +447,8 @@ Secrets are masked in every log.
 Without WHMCS or a network (PHP 7.4+):
 
 ```
-php tests/run.php              # signature, settings, amounts, line items, the checkout request, Subscribe plans, buttons, refund USD cents, events, cycles
-php tests/webhook-harness.php  # the full webhook path: invoices, bindings, renewals, refunds and the Gateway Log for every event
+php tests/run.php              # signature, settings, amounts, line items, the checkout request, Subscribe plans, start dates, groups, notes, buttons, matching, refund USD cents, events, cycles
+php tests/webhook-harness.php  # the invoice block, the Subscribe checkout and the full webhook path: invoices, bindings, renewals per subscription, refunds and the Gateway Log
 ```
 
 Both exit 0 when all checks pass and 1 otherwise. `tests/fixtures/*.json` are real envelopes produced by
@@ -396,7 +468,9 @@ With Platform Mode on Test:
 | Wrong signing secret | Callback returns 401; Gateway Log `Invalid Signature` |
 | Refund in WHMCS, full and partial | Refund recorded in WHMCS and shown in PaymentHooks |
 | Subscribe & Auto-pay on hosting + addon | Service and addon show the subscription id; the next renewal is charged by PaymentHooks and marks the renewal invoice Paid |
-| Hosting monthly + domain yearly | The page says the domain is charged once; it is not bound |
+| Hosting monthly + domain yearly | One checkout; the hosting and the domain each get their own subscription id; each renewal pays its own invoice |
+| New domain at a first-year discount | Subscribe offered; first year charged once, the domain renews at full price from its next due date |
+| Part-paid invoice | Only Pay Now, with the note under it |
 | Renewal before WHMCS raised the invoice | The invoice is raised and paid; Gateway Log `Subscription Renewal Paid` |
 | Failed renewal | The invoice stays Unpaid with a note; WHMCS reminders run |
 | Refund in the PaymentHooks dashboard | Refund recorded on the WHMCS invoice |
