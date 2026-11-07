@@ -8,8 +8,11 @@
  *                     minor units of itemLocalCurrency
  *   itemLocalCurrency required ISO code, upper case; amounts stay in this currency
  *   mode              "payment" | "subscription"
- *   metadata          the subscription price goes in metadata.priceId (the only
- *                     place the server reads it)
+ *   lineItems[].recurring { interval, intervalCount }
+ *                     subscription mode only: the line renews at its unitPrice
+ *                     on that cadence; lines without it are charged once on the
+ *                     first invoice (setup fees, other-cycle items). Every
+ *                     recurring line of one session shares one cadence.
  *   itemConvenienceFeeLocalCurrencyAmount
  *                     integer minor units, added to the total by the server
  *   itemTaxLocalCurrencyAmount + taxBehavior "inclusive"
@@ -33,6 +36,7 @@ class CheckoutBuilder
 {
     /**
      * @param array{lineItems: array, subtotal_minor: int, tax_minor?: int, tax_rate?: float} $mapped from InvoiceMapper
+     * @param array|null $plan RecurringPlanner::plan() result; required in subscription mode
      * @return array request body
      */
     public static function build(
@@ -44,13 +48,18 @@ class CheckoutBuilder
         string $systemUrl,
         string $customerId,
         string $customerEmail,
-        string $priceId
+        ?array $plan = null
     ): array {
         if ($currency === '' || !preg_match('/^[A-Z]{3}$/', $currency)) {
             throw new \InvalidArgumentException('Invoice ' . $invoiceId . ' has no valid currency code.');
         }
-        if ($mode === 'subscription' && $priceId === '') {
-            throw new \InvalidArgumentException('A subscription checkout needs a PaymentHooks price id.');
+        $lineItems = $mapped['lineItems'];
+        if ($mode === 'subscription') {
+            if (!is_array($plan) || empty($plan['offer'])) {
+                throw new \InvalidArgumentException('Invoice ' . $invoiceId . ' cannot be subscribed: '
+                    . (is_array($plan) && $plan['reason'] !== '' ? $plan['reason'] : 'no subscription plan.'));
+            }
+            $lineItems = $plan['lineItems'];
         }
 
         $systemUrl = rtrim($systemUrl, '/');
@@ -59,13 +68,13 @@ class CheckoutBuilder
             'whmcs_system_url' => $systemUrl,
         ];
         if ($mode === 'subscription') {
-            $metadata['priceId'] = $priceId;
+            $metadata['whmcs_subscribed_items'] = (string) count($plan['subscribed']);
         }
 
         $body = [
             'mode'                       => $mode,
             'itemLocalCurrency'          => $currency,
-            'lineItems'                  => $mapped['lineItems'],
+            'lineItems'                  => $lineItems,
             'successUrl'                 => $systemUrl . '/viewinvoice.php?id=' . $invoiceId . '&paymentsuccess=true',
             'cancelUrl'                  => $systemUrl . '/viewinvoice.php?id=' . $invoiceId . '&paymentfailed=true',
             'metadata'                   => $metadata,
@@ -96,6 +105,32 @@ class CheckoutBuilder
             $body['itemConvenienceFeeLocalCurrencyAmount'] = $fee;
         }
         return $body;
+    }
+
+    /**
+     * True when PaymentHooks kept every `recurring` the request sent (the
+     * created session echoes its line items). An API without inline recurring
+     * line items drops the field; that session would charge once and never
+     * renew, so the caller must refuse it instead of redirecting the client.
+     */
+    public static function recurringAccepted(array $sentLineItems, array $session): bool
+    {
+        $echoed = $session['lineItems'] ?? null;
+        if (!is_array($echoed) || count($echoed) !== count($sentLineItems)) {
+            return false;
+        }
+        foreach ($sentLineItems as $i => $sent) {
+            if (!isset($sent['recurring'])) {
+                continue;
+            }
+            $got = $echoed[$i]['recurring'] ?? null;
+            if (!is_array($got)
+                || ($got['interval'] ?? '') !== $sent['recurring']['interval']
+                || (int) ($got['intervalCount'] ?? 1) !== (int) $sent['recurring']['intervalCount']) {
+                return false;
+            }
+        }
+        return ($session['mode'] ?? '') === 'subscription';
     }
 
     /**

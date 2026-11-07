@@ -2,6 +2,7 @@
     "schema": "1.0",
     "type": "whmcs-gateways",
     "name": "paymenthooks",
+    "version": "3.1.0",
     "license": "MIT",
     "category": "gateway",
     "description": {
@@ -11,7 +12,9 @@
         "features": [
             "Hosted redirect checkout, optionally on your custom domain",
             "One-time payments with full and partial refunds",
-            "Recurring billing driven by PaymentHooks subscriptions",
+            "Pay Now or Subscribe & Auto-pay: hosting, domains and addons renew automatically, charged by PaymentHooks",
+            "Renewal invoices raised and paid from webhooks; WHMCS never captures",
+            "Refunds made in PaymentHooks recorded on the WHMCS invoice",
             "Signed webhook reconciliation, each event applied once",
             "Test and live through your PaymentHooks Platform Mode"
         ]

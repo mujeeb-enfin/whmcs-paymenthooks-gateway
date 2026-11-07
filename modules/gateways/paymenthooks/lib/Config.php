@@ -40,10 +40,8 @@ class Config
     public $descriptionTemplate = 'Invoice {invoiceid}';
     /** @var string name of the invoice tax (GST, VAT), '' for "Tax" */
     public $taxName = '';
-    /** @var bool */
+    /** @var bool shows the "Subscribe & Auto-pay" button next to "Pay Now" */
     public $subscriptionsEnabled = false;
-    /** @var string one of: auto, subscription, payment */
-    public $paymentModePolicy = 'auto';
     /** @var bool */
     public $logging = false;
 
@@ -61,10 +59,10 @@ class Config
         $template = trim((string) ($params['descriptionTemplate'] ?? ''));
         $c->descriptionTemplate  = $template !== '' ? $template : 'Invoice {invoiceid}';
         $c->taxName = mb_substr(trim((string) ($params['taxName'] ?? '')), 0, 60);
-        $c->subscriptionsEnabled = !empty($params['enableSubscriptions']) && $params['enableSubscriptions'] !== 'off';
-
-        $policy = (string) ($params['paymentModePolicy'] ?? 'auto');
-        $c->paymentModePolicy = in_array($policy, ['auto', 'subscription', 'payment'], true) ? $policy : 'auto';
+        $c->subscriptionsEnabled = self::migratedSubscriptionsEnabled(
+            isset($params['paymentModePolicy']) ? (string) $params['paymentModePolicy'] : null,
+            !empty($params['enableSubscriptions']) && $params['enableSubscriptions'] !== 'off'
+        );
 
         $c->logging = !empty($params['logging']) && $params['logging'] !== 'off';
 
@@ -100,27 +98,39 @@ class Config
     }
 
     /**
-     * Resolves the PH checkout session `mode` for an invoice given the admin
-     * policy and whether the invoice contains a recurring item.
+     * The checkout mode for the button the client pressed. The client chooses:
+     * "Pay Now" is always one-time; "Subscribe & Auto-pay" starts a
+     * PaymentHooks subscription and is only offered when the admin enabled it.
+     * Anything other than an explicit "subscription" is a one-time payment
+     * (older templates post no mode at all).
      *
-     *   payment      -> always "payment" (one-time), even for recurring products
-     *   subscription -> "subscription" on every invoice (needs subscriptions enabled)
-     *   auto         -> "subscription" when recurring and subscriptions enabled, else "payment"
-     *
-     * @throws ConfigException when the policy forces subscriptions but they are disabled
+     * @throws ConfigException when a subscription is requested but the admin turned it off
      */
-    public function resolveCheckoutMode(bool $invoiceHasRecurringItem): string
+    public function resolveCheckoutMode(string $requested): string
     {
-        if ($this->paymentModePolicy === 'payment') {
+        if ($requested !== 'subscription') {
             return 'payment';
         }
-        if ($this->paymentModePolicy === 'subscription') {
-            if (!$this->subscriptionsEnabled) {
-                throw new ConfigException('Payment Mode is "Subscription only" but Enable Subscriptions is off.');
-            }
-            return 'subscription';
+        if (!$this->subscriptionsEnabled) {
+            throw new ConfigException('Subscribe & Auto-pay was requested but Enable Subscriptions is off in the module settings.');
         }
-        return ($this->subscriptionsEnabled && $invoiceHasRecurringItem) ? 'subscription' : 'payment';
+        return 'subscription';
+    }
+
+    /**
+     * Settings migration from the retired "Payment Mode" dropdown. It forced a
+     * mode per invoice; now the client chooses and the admin only enables the
+     * Subscribe button. "One-time only" meant "never subscribe", so it turns
+     * the button off; "Auto" and "Subscription only" keep the admin's
+     * Enable Subscriptions choice. Schema::ensure() writes the result back
+     * once and deletes the old setting.
+     */
+    public static function migratedSubscriptionsEnabled(?string $legacyPolicy, bool $enabled): bool
+    {
+        if ($legacyPolicy === 'payment') {
+            return false;
+        }
+        return $enabled;
     }
 
     /**

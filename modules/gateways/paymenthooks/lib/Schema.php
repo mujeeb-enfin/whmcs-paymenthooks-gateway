@@ -4,9 +4,15 @@
  *
  *   mod_paymenthooks_events    - seen webhook event ids (duplicate guard)
  *   mod_paymenthooks_sessions  - invoice -> checkout session / payment id mapping,
- *                                plus the convenience fee added to the session
+ *                                the convenience fee added to the session and,
+ *                                for Subscribe & Auto-pay, the items subscribed
  *   mod_paymenthooks_price_map - WHMCS product + billing cycle -> PH price id
  *   mod_paymenthooks_install   - one random id per install (idempotency keys)
+ *   mod_paymenthooks_subscriptions - PH subscription -> WHMCS service, domain or
+ *                                addon it auto-renews (one row per item)
+ *   mod_paymenthooks_refunds   - refunds known on each PH payment (issued from
+ *                                WHMCS or recorded from a dashboard refund),
+ *                                so payment.refunded is never booked twice
  */
 
 namespace PaymentHooks;
@@ -78,12 +84,19 @@ class Schema
                 $t->string('subscription_id', 191)->nullable()->index();
                 $t->string('status', 40)->default('open');
                 $t->integer('fee_minor')->default(0);
+                $t->text('plan_json')->nullable();
                 $t->integer('created_at');
                 $t->integer('updated_at');
             });
-        } elseif (!$sm->hasColumn('mod_paymenthooks_sessions', 'fee_minor')) {
-            $sm->table('mod_paymenthooks_sessions', function ($t) {
-                $t->integer('fee_minor')->default(0);
+        } else {
+            $sm->table('mod_paymenthooks_sessions', function ($t) use ($sm) {
+                if (!$sm->hasColumn('mod_paymenthooks_sessions', 'fee_minor')) {
+                    $t->integer('fee_minor')->default(0);
+                }
+                // The items a subscription checkout subscribed, bound on completion.
+                if (!$sm->hasColumn('mod_paymenthooks_sessions', 'plan_json')) {
+                    $t->text('plan_json')->nullable();
+                }
             });
         }
 
@@ -116,5 +129,72 @@ class Schema
                 }
             });
         }
+
+        if (!$sm->hasTable('mod_paymenthooks_subscriptions')) {
+            $sm->create('mod_paymenthooks_subscriptions', function ($t) {
+                $t->increments('id');
+                $t->string('subscription_id', 191)->index();
+                $t->string('rel_type', 20);
+                $t->integer('rel_id');
+                $t->integer('invoice_id');
+                $t->string('currency', 10);
+                $t->integer('amount_minor');
+                $t->string('billing_interval', 10);
+                $t->integer('interval_count');
+                $t->string('status', 20)->default('active');
+                $t->integer('created_at');
+                $t->integer('updated_at');
+                $t->index(['rel_type', 'rel_id']);
+            });
+        }
+
+        if (!$sm->hasTable('mod_paymenthooks_refunds')) {
+            $sm->create('mod_paymenthooks_refunds', function ($t) {
+                $t->increments('id');
+                $t->string('payment_id', 191)->index();
+                $t->string('source', 20);
+                $t->string('refund_id', 191)->nullable();
+                $t->integer('amount_minor');
+                $t->integer('created_at');
+            });
+        }
+
+        self::migrateSettings();
+    }
+
+    /**
+     * The retired "Payment Mode" setting forced subscription or one-time per
+     * invoice. The client now chooses between Pay Now and Subscribe & Auto-pay,
+     * and Enable Subscriptions only shows the Subscribe button. "One-time only"
+     * becomes Enable Subscriptions off (see Config::migratedSubscriptionsEnabled);
+     * the old row is then removed so the migration runs once.
+     */
+    private static function migrateSettings(): void
+    {
+        $legacy = Capsule::table('tblpaymentgateways')
+            ->where('gateway', 'paymenthooks')
+            ->where('setting', 'paymentModePolicy')
+            ->value('value');
+        if ($legacy === null) {
+            return;
+        }
+        if ((string) $legacy === 'payment') {
+            Capsule::table('tblpaymentgateways')
+                ->where('gateway', 'paymenthooks')
+                ->where('setting', 'enableSubscriptions')
+                ->update(['value' => '']);
+        }
+        Capsule::table('tblpaymentgateways')
+            ->where('gateway', 'paymenthooks')
+            ->where('setting', 'paymentModePolicy')
+            ->delete();
+        logActivity('PaymentHooks: migrated the retired Payment Mode setting ("' . $legacy . '"). Clients now choose Pay Now '
+            . 'or Subscribe & Auto-pay; Enable Subscriptions shows the Subscribe button.');
+    }
+
+    /** True when WHMCS has a native subscriptionid column on this table (mirrored for display and cancellation). */
+    public static function hasSubscriptionColumn(string $table): bool
+    {
+        return Capsule::schema()->hasColumn($table, 'subscriptionid');
     }
 }

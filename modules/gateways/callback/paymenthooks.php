@@ -2,8 +2,9 @@
 /**
  * PaymentHooks callback endpoint. Two jobs:
  *
- *  1. action=checkout (POST from the invoice "Pay Now" button): create a PH
- *     checkout session for the invoice and redirect the client to the hosted page.
+ *  1. action=checkout (POST from the invoice "Pay Now" or "Subscribe & Auto-pay"
+ *     button, mode=payment|subscription): create a PH checkout session for the
+ *     invoice and redirect the client to the hosted page.
  *  2. Webhook receiver (POST from the PH webhook endpoint with
  *     X-PaymentHooks-Signature): verify, dedupe, and reconcile the WHMCS invoice.
  */
@@ -18,7 +19,7 @@ use PaymentHooks\Signature;
 use PaymentHooks\Schema;
 use PaymentHooks\InvoiceMapper;
 use PaymentHooks\CheckoutBuilder;
-use PaymentHooks\PriceResolver;
+use PaymentHooks\InvoicePlan;
 use PaymentHooks\WebhookRouter;
 
 require_once __DIR__ . '/../../../init.php';
@@ -80,7 +81,9 @@ function handle_checkout_click(Config $config, Logger $logger, array $params): v
         $client = new Client($config, $logger);
         $currency = WebhookRouter::invoiceCurrency((int) $invoice->userid);
         $mapped = InvoiceMapper::buildLineItems($invoiceId, $currency);
-        $mode = $config->resolveCheckoutMode(invoice_has_recurring_item($invoiceId));
+        // The client chose with the button they pressed; Pay Now is one-time.
+        $mode = $config->resolveCheckoutMode((string) ($_POST['mode'] ?? 'payment'));
+        $plan = $mode === 'subscription' ? InvoicePlan::forInvoice($invoiceId, $currency) : null;
 
         // PaymentHooks has taken (or is taking) a payment whose webhook has not
         // arrived yet: never start a second charge.
@@ -95,11 +98,6 @@ function handle_checkout_click(Config $config, Logger $logger, array $params): v
             exit;
         }
 
-        $priceId = '';
-        if ($mode === 'subscription') {
-            $priceId = (new PriceResolver($client, $logger))->resolveForInvoice($invoiceId, $currency);
-        }
-
         $email = trim((string) Capsule::table('tblclients')->where('id', $invoice->userid)->value('email'));
         $body = CheckoutBuilder::build(
             $config,
@@ -110,7 +108,7 @@ function handle_checkout_click(Config $config, Logger $logger, array $params): v
             (string) $params['systemurl'],
             resolve_customer_id($client, (int) $invoice->userid),
             $email,
-            $priceId
+            $plan
         );
 
         // Unique per attempt: guards one create against a double submit, while
@@ -124,6 +122,14 @@ function handle_checkout_click(Config $config, Logger $logger, array $params): v
         if ($sessionId === '' || $url === '') {
             throw new ApiException('PaymentHooks did not return a checkout session id and URL.', 'UNEXPECTED_RESPONSE');
         }
+        // A PaymentHooks API without inline recurring line items ignores
+        // `recurring`: that session would charge once and never renew. Refuse
+        // it (the client is never sent there) instead of guessing a price.
+        if ($mode === 'subscription' && !CheckoutBuilder::recurringAccepted($body['lineItems'], (array) $resp['data'])) {
+            throw new ApiException('PaymentHooks did not accept the recurring line items (lineItems[].recurring) for session '
+                . $sessionId . '; Subscribe & Auto-pay needs a PaymentHooks API with subscription line items. The client can use Pay Now.',
+                'RECURRING_LINE_ITEMS_UNSUPPORTED');
+        }
 
         $now = time();
         Capsule::table('mod_paymenthooks_sessions')->insert([
@@ -131,6 +137,8 @@ function handle_checkout_click(Config $config, Logger $logger, array $params): v
             'session_id' => $sessionId,
             'status'     => 'open',
             'fee_minor'  => (int) ($body['itemConvenienceFeeLocalCurrencyAmount'] ?? 0),
+            // What this checkout subscribes, bound to the subscription on completion.
+            'plan_json'  => $plan ? json_encode(['subscribed' => $plan['subscribed']], JSON_UNESCAPED_SLASHES) : null,
             'created_at' => $now,
             'updated_at' => $now,
         ]);
@@ -366,11 +374,6 @@ function resolve_customer_id(Client $client, int $userId): string
         }
     }
     throw new ApiException('PaymentHooks reported a duplicate email but the customer could not be found.', 'CUSTOMER_LOOKUP_FAILED');
-}
-
-function invoice_has_recurring_item(int $invoiceId): bool
-{
-    return PriceResolver::firstRecurringServiceId($invoiceId) > 0;
 }
 
 function redirect_to_invoice(int $invoiceId, string $flag): void

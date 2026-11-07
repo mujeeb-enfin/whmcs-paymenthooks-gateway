@@ -20,8 +20,12 @@
  * are informational (Gateway Log) only.
  *   subscription.renewed            object = subscription
  *     id, latest_payment { id, amount, currency } (absent when credit covered it)
- *   subscription.renewal_failed     object = subscription
+ *   subscription.renewal_failed     object = subscription (failure_reason when known)
  *   subscription.cancelled          object = subscription (status "cancelled")
+ *   subscription.deleted            object = subscription
+ *   invoice.paid                    object = invoice
+ *     id, subscription (id|null), payment_intent (payment id), amount_paid,
+ *     currency (lowercase), billing_reason
  *
  * Pure PHP (no WHMCS calls) so it is unit-tested in tests/run.php.
  */
@@ -83,18 +87,41 @@ class EventParser
      * Subscription event. `paymentId`/`amountMinor` are set only on a charged
      * renewal; a renewal fully covered by credit has no payment.
      *
-     * @return array{subscriptionId:string,status:string,paymentId:string,amountMinor:int,currency:string}
+     * @return array{subscriptionId:string,status:string,paymentId:string,amountMinor:int,currency:string,failureReason:string}
      */
     public static function subscription(array $event): array
     {
         $o = self::object($event);
         $pay = is_array($o['latest_payment'] ?? null) ? $o['latest_payment'] : [];
+        $error = is_array($o['last_payment_error'] ?? null) ? $o['last_payment_error'] : [];
+        $reason = self::str($o['failure_reason'] ?? ($error['message'] ?? null));
         return [
             'subscriptionId' => self::str($o['id'] ?? null),
             'status'         => self::str($o['status'] ?? null),
             'paymentId'      => self::str($pay['id'] ?? null),
             'amountMinor'    => self::int($pay['amount'] ?? null),
             'currency'       => strtoupper(self::str($pay['currency'] ?? ($o['currency'] ?? null))),
+            'failureReason'  => function_exists('mb_substr') ? mb_substr($reason, 0, 300) : substr($reason, 0, 300),
+        ];
+    }
+
+    /**
+     * Paid PaymentHooks invoice (invoice.paid). A renewal arrives as
+     * subscription.renewed and as invoice.paid for its invoice; both carry the
+     * same payment id, so whichever comes second is a Duplicate.
+     *
+     * @return array{invoiceId:string,subscriptionId:string,paymentId:string,amountMinor:int,currency:string,billingReason:string}
+     */
+    public static function invoicePaid(array $event): array
+    {
+        $o = self::object($event);
+        return [
+            'invoiceId'      => self::str($o['id'] ?? null),
+            'subscriptionId' => self::str($o['subscription'] ?? null),
+            'paymentId'      => self::str($o['payment_intent'] ?? null),
+            'amountMinor'    => self::int($o['amount_paid'] ?? null),
+            'currency'       => strtoupper(self::str($o['currency'] ?? null)),
+            'billingReason'  => self::str($o['billing_reason'] ?? null),
         ];
     }
 

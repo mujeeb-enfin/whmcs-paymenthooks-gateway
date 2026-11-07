@@ -5,7 +5,7 @@
  * Handled events (subscribe the endpoint to these):
  *   checkout.session.completed, checkout.session.payment_failed,
  *   payment.refunded, subscription.renewed, subscription.renewal_failed,
- *   subscription.cancelled
+ *   subscription.cancelled, subscription.deleted, invoice.paid
  *
  * dispatch() returns true when the event is fully handled (respond 200) and
  * false when it must be redelivered (respond 500). An event that can never be
@@ -51,11 +51,14 @@ class WebhookRouter
                 return $this->onRefunded($event);
             case 'subscription.renewed':
                 return $this->onRenewed($event);
+            case 'invoice.paid':
+                return $this->onInvoicePaid($event);
             case 'subscription.renewal_failed':
                 $sub = EventParser::subscription($event);
-                $this->subSync->handleRenewalFailed($sub['subscriptionId']);
+                $this->subSync->handleRenewalFailed($sub['subscriptionId'], $sub['failureReason']);
                 return true;
             case 'subscription.cancelled':
+            case 'subscription.deleted':
                 $sub = EventParser::subscription($event);
                 $this->subSync->handleCancelled($sub['subscriptionId']);
                 return true;
@@ -115,25 +118,58 @@ class WebhookRouter
             ->update($update);
 
         if ($s['subscriptionId'] !== '') {
-            $this->bindSubscriptionToService($s['invoiceId'], $s['subscriptionId']);
+            $this->bindSubscription($s['invoiceId'], $s['sessionId'], $s['subscriptionId'], $s['currency']);
         }
         return true;
     }
 
     /**
-     * Stores the PH subscription id on the one recurring service it was created
-     * for (PriceResolver priced the first recurring service). WHMCS passes it
-     * back to paymenthooks_cancelSubscription() as $params['subscriptionID'].
+     * Binds the subscription to every item the checkout subscribed (the plan
+     * stored with the session when it was created). Sessions opened by earlier
+     * module versions have no plan and subscribed only the first service.
      */
-    private function bindSubscriptionToService(int $invoiceId, string $subscriptionId): void
+    private function bindSubscription(int $invoiceId, string $sessionId, string $subscriptionId, string $currency): void
     {
+        $planJson = (string) Capsule::table('mod_paymenthooks_sessions')->where('session_id', $sessionId)->value('plan_json');
+        $plan = $planJson !== '' ? json_decode($planJson, true) : null;
+        if (is_array($plan) && !empty($plan['subscribed'])) {
+            SubscriptionMap::bind($subscriptionId, $invoiceId, $currency, $plan['subscribed']);
+            return;
+        }
         $serviceId = PriceResolver::firstRecurringServiceId($invoiceId);
         if ($serviceId <= 0) {
             $this->logger->error('webhook-subscription-unbound', ['invoiceId' => $invoiceId, 'subscriptionId' => $subscriptionId],
-                'No recurring service on invoice ' . $invoiceId . ' to bind subscription ' . $subscriptionId . ' to; renewals will not be recorded.');
+                'No recurring item recorded for invoice ' . $invoiceId . ' to bind subscription ' . $subscriptionId . ' to; renewals will not be recorded.');
             return;
         }
-        Capsule::table('tblhosting')->where('id', $serviceId)->update(['subscriptionid' => $subscriptionId]);
+        $row = Capsule::table('tblhosting')->where('id', $serviceId)->first();
+        $cycle = $row ? (string) $row->billingcycle : '';
+        SubscriptionMap::bind($subscriptionId, $invoiceId, $currency, [[
+            'relType'       => 'hosting',
+            'relId'         => $serviceId,
+            'renewalMinor'  => $row ? InvoiceMapper::toMinorUnits((float) $row->amount, $currency) : 0,
+            'interval'      => (string) PriceResolver::cycleToInterval($cycle),
+            'intervalCount' => PriceResolver::cycleToIntervalCount($cycle),
+        ]]);
+    }
+
+    /**
+     * A paid PaymentHooks invoice of a subscription bound here is a renewal.
+     * The first invoice is the checkout, already recorded from
+     * checkout.session.completed with the same payment id (Duplicate here).
+     */
+    private function onInvoicePaid(array $event): bool
+    {
+        $inv = EventParser::invoicePaid($event);
+        if ($inv['subscriptionId'] === '') {
+            $this->log->set(GatewayLog::IGNORED, 'Invoice ' . $inv['invoiceId'] . ' is not a subscription invoice; acknowledged.', $inv);
+            return true;
+        }
+        if ($inv['paymentId'] === '') {
+            $this->log->set(GatewayLog::IGNORED, 'Invoice ' . $inv['invoiceId'] . ' was paid without a charge (credit); nothing to record.', $inv);
+            return true;
+        }
+        return $this->subSync->handleRenewalPaid($inv['subscriptionId'], $inv['paymentId'], $inv['amountMinor'], $inv['currency'], true);
     }
 
     private function onCheckoutFailed(array $event): bool
@@ -150,21 +186,17 @@ class WebhookRouter
     }
 
     /**
-     * Refunds issued from WHMCS are recorded by WHMCS when paymenthooks_refund()
-     * returns. A refund made in the PaymentHooks dashboard is logged here for
-     * the admin to reflect in WHMCS.
+     * A refund made at PaymentHooks (dashboard or API) is recorded on the
+     * WHMCS invoice; refunds issued from WHMCS are already known (RefundSync).
      */
     private function onRefunded(array $event): bool
     {
         $r = EventParser::paymentRefunded($event);
-        if ($r['paymentId'] === '' || !InvoiceMapper::transactionExists($r['paymentId'], self::GATEWAY)) {
-            $this->log->set(GatewayLog::IGNORED, 'Refunded payment is not recorded in this WHMCS; acknowledged.', $r);
+        if ($r['paymentId'] === '' || $r['amountRefundedMinor'] <= 0 || $r['currency'] === '') {
+            $this->log->set(GatewayLog::IGNORED, 'Refund event without payment id, amount or currency; acknowledged.', $r);
             return true;
         }
-        $this->log->set(GatewayLog::REFUND, 'PaymentHooks reports ' . InvoiceMapper::toMajorUnits($r['amountRefundedMinor'], $r['currency'])
-            . ' ' . $r['currency'] . ' refunded on payment ' . $r['paymentId'] . '. Refunds made in WHMCS are already recorded; '
-            . 'one made in the PaymentHooks dashboard must be added to the invoice manually.', $r);
-        return true;
+        return (new RefundSync($this->logger, $this->log))->apply($r);
     }
 
     private function onRenewed(array $event): bool

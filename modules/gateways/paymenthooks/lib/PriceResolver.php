@@ -1,13 +1,14 @@
 <?php
 /**
- * Maps a WHMCS recurring service to a PaymentHooks Product + recurring Price,
- * so a subscription-mode checkout can reference a real priceId (the thing PH
- * needs to establish a mandate and run the billing cycle).
+ * WHMCS billing cycles as PaymentHooks recurring cadences, plus the legacy
+ * service lookup for subscriptions bound by module versions before the
+ * mod_paymenthooks_subscriptions table.
  *
- * The mapping is cached in mod_paymenthooks_price_map keyed by
- * (product_id, billing_cycle, currency, amount_minor). Amount/currency are part
- * of the key because the same WHMCS product can be sold at different prices
- * (promos, currency, config options), and a PH Price is immutable per amount.
+ * Subscriptions no longer use PaymentHooks Products/Prices: each subscribed
+ * line carries its own `recurring` cadence on the checkout session
+ * (CheckoutBuilder), because a WHMCS service's price is per client (promos,
+ * config options, currency). mod_paymenthooks_price_map is kept for installs
+ * that have rows in it but is no longer written.
  */
 
 namespace PaymentHooks;
@@ -20,93 +21,10 @@ use WHMCS\Database\Capsule;
 
 class PriceResolver
 {
-    /** @var Client */
-    private $client;
-    /** @var Logger */
-    private $logger;
-
-    public function __construct(Client $client, Logger $logger)
-    {
-        $this->client = $client;
-        $this->logger = $logger;
-    }
-
     /**
-     * Returns a PH price id for the recurring service on this invoice, creating
-     * the PH product/price on first use.
-     *
-     * @param int    $invoiceId
-     * @param string $currency   ISO code (e.g. INR)
-     * @return string PH price id
-     * @throws \RuntimeException when no subscription price can be established
-     */
-    public function resolveForInvoice(int $invoiceId, string $currency): string
-    {
-        $service = $this->firstRecurringService($invoiceId);
-        if ($service === null) {
-            throw new \RuntimeException('Invoice ' . $invoiceId . ' has no recurring service to subscribe to.');
-        }
-
-        $cycle = strtolower((string) $service->billingcycle);
-        $interval = self::cycleToInterval($cycle);
-        if ($interval === null) {
-            throw new \RuntimeException('Billing cycle "' . $cycle . '" cannot be billed as a PaymentHooks subscription.');
-        }
-        $intervalCount = self::cycleToIntervalCount($cycle);
-
-        $amountMinor = InvoiceMapper::toMinorUnits((float) $service->amount, $currency);
-        if ($amountMinor <= 0) {
-            throw new \RuntimeException('Recurring amount for service ' . $service->id . ' is zero.');
-        }
-
-        $productId = (int) $service->packageid;
-        $currencyU = strtoupper($currency);
-
-        // Cache hit?
-        $row = Capsule::table('mod_paymenthooks_price_map')
-            ->where('product_id', $productId)
-            ->where('billing_cycle', $cycle)
-            ->where('currency', $currencyU)
-            ->where('amount_minor', $amountMinor)
-            ->orderBy('id', 'desc')
-            ->first();
-        if ($row && $row->ph_price_id) {
-            return $row->ph_price_id;
-        }
-
-        // Create PH product (reuse if we already made one for this WHMCS product).
-        $phProductId = $this->ensureProduct($productId);
-
-        // Create the recurring price.
-        $phPriceId = $this->createPrice($phProductId, $amountMinor, $currencyU, $interval, $intervalCount);
-
-        Capsule::table('mod_paymenthooks_price_map')->insert([
-            'product_id'    => $productId,
-            'billing_cycle' => $cycle,
-            'currency'      => $currencyU,
-            'amount_minor'  => $amountMinor,
-            'ph_product_id' => $phProductId,
-            'ph_price_id'   => $phPriceId,
-            'created_at'    => time(),
-        ]);
-
-        return $phPriceId;
-    }
-
-    /** First recurring (non one-time) hosting service on the invoice, or null. */
-    private function firstRecurringService(int $invoiceId)
-    {
-        $id = self::firstRecurringServiceId($invoiceId);
-        if ($id === 0) {
-            return null;
-        }
-        return Capsule::table('tblhosting')->where('id', $id)->first();
-    }
-
-    /**
-     * Pure-DB: id of the first recurring (non one-time/free) hosting service on
-     * the invoice, or 0. Shared with the webhook so the subscription is bound to
-     * exactly the service it was created for, not every service on the invoice.
+     * Id of the first recurring (non one-time/free) hosting service on the
+     * invoice, or 0. Used only for checkouts opened by earlier module versions,
+     * which subscribed exactly this service.
      */
     public static function firstRecurringServiceId(int $invoiceId): int
     {
@@ -120,8 +38,7 @@ class PriceResolver
             return 0;
         }
 
-        // Preserve invoice-item order so "first" is deterministic and matches
-        // what resolveForInvoice billed.
+        // Invoice-item order, as the earlier versions priced it.
         foreach ($relIds as $relId) {
             $row = Capsule::table('tblhosting')->where('id', $relId)->first();
             if (!$row) {
@@ -133,77 +50,6 @@ class PriceResolver
             }
         }
         return 0;
-    }
-
-    /** Reuses the PH product id already recorded for this WHMCS product, else creates one. */
-    private function ensureProduct(int $whmcsProductId): string
-    {
-        $existing = Capsule::table('mod_paymenthooks_price_map')
-            ->where('product_id', $whmcsProductId)
-            ->whereNotNull('ph_product_id')
-            ->orderBy('id', 'desc')
-            ->value('ph_product_id');
-        if ($existing) {
-            return (string) $existing;
-        }
-
-        $name = (string) Capsule::table('tblproducts')->where('id', $whmcsProductId)->value('name');
-        if ($name === '') {
-            $name = 'WHMCS Product ' . $whmcsProductId;
-        }
-
-        try {
-            // /products does not honour Idempotency-Key; the price map caches
-            // the id so a product is created once per WHMCS product.
-            $resp = $this->client->post('/products', [
-                'name'     => $name,
-                'type'     => 'service',
-                'metadata' => ['whmcs_product_id' => (string) $whmcsProductId],
-            ]);
-        } catch (ApiException $e) {
-            $this->logger->error('price-ensure-product', ['whmcsProductId' => $whmcsProductId], $e->getMessage());
-            throw new \RuntimeException('Could not create the PaymentHooks product: ' . $e->getMessage(), 0, $e);
-        }
-        $id = (string) ($resp['data']['id'] ?? '');
-        if ($id === '') {
-            throw new \RuntimeException('PaymentHooks returned no product id.');
-        }
-        return $id;
-    }
-
-    private function createPrice(string $phProductId, int $amountMinor, string $currency, string $interval, int $intervalCount): string
-    {
-        $body = self::priceBody($phProductId, $amountMinor, $currency, $interval, $intervalCount);
-        try {
-            $resp = $this->client->post('/prices', $body);
-        } catch (ApiException $e) {
-            $this->logger->error('price-create', compact('phProductId', 'amountMinor', 'currency', 'interval', 'intervalCount'), $e->getMessage());
-            throw new \RuntimeException('Could not create the PaymentHooks price: ' . $e->getMessage(), 0, $e);
-        }
-        $id = (string) ($resp['data']['id'] ?? '');
-        if ($id === '') {
-            throw new \RuntimeException('PaymentHooks returned no price id.');
-        }
-        return $id;
-    }
-
-    /**
-     * POST /prices body: the recurring price in the invoice currency's minor
-     * units (PaymentHooks stores USD cents alongside at the live rate).
-     */
-    public static function priceBody(string $phProductId, int $amountMinor, string $currency, string $interval, int $intervalCount): array
-    {
-        $body = [
-            'productId'               => $phProductId,
-            'itemLocalCurrencyAmount' => $amountMinor,
-            'itemLocalCurrency'       => strtoupper($currency),
-            'type'                    => 'recurring',
-            'interval'                => $interval,
-        ];
-        if ($intervalCount > 1) {
-            $body['intervalCount'] = $intervalCount;
-        }
-        return $body;
     }
 
     /**

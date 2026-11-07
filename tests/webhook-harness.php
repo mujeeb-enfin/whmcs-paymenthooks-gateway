@@ -16,6 +16,8 @@ namespace WHMCS\Database {
     {
         /** @var array<string, array<int, array>> */
         public static $tables = [];
+        /** Tables that have a native subscriptionid column in the simulated WHMCS version. */
+        public static $withSubscriptionColumn = ['tblhosting', 'tbldomains', 'tblhostingaddons'];
 
         public static function table(string $name): Query
         {
@@ -34,13 +36,14 @@ namespace WHMCS\Database {
     class Schema
     {
         public function hasTable(string $t): bool { return true; }
-        public function hasColumn(string $t, string $c): bool { return true; }
+        public function hasColumn(string $t, string $c): bool { return in_array($t, Capsule::$withSubscriptionColumn, true); }
     }
 
     class Query
     {
         private $table;
         private $wheres = [];
+        private $order = null;
 
         public function __construct(string $table) { $this->table = $table; }
 
@@ -68,7 +71,7 @@ namespace WHMCS\Database {
             return $this;
         }
         public function whereNotNull(string $col): self { $this->wheres[] = [$col, 'notnull', null]; return $this; }
-        public function orderBy(string $c, string $d = 'asc'): self { return $this; }
+        public function orderBy(string $c, string $d = 'asc'): self { $this->order = [$c, $d]; return $this; }
         public function limit(int $n): self { return $this; }
         public function join(): self { return $this; }
 
@@ -83,10 +86,14 @@ namespace WHMCS\Database {
                     if ($op === '=' && $x != $v) { $ok = false; }
                     if ($op === '<' && !($x < $v)) { $ok = false; }
                     if ($op === '>' && !($x > $v)) { $ok = false; }
-                    if ($op === 'in' && !in_array($x, $v)) { $ok = false; }
+                    if ($op === 'in' && !in_array($x, (array) $v)) { $ok = false; }
                     if ($op === 'notnull' && $x === null) { $ok = false; }
                 }
                 if ($ok) { $out[$i] = $r; }
+            }
+            if ($this->order) {
+                [$c, $d] = $this->order;
+                uasort($out, function ($a, $b) use ($c, $d) { $x = ($a[$c] ?? 0) <=> ($b[$c] ?? 0); return $d === 'desc' ? -$x : $x; });
             }
             return $out;
         }
@@ -106,6 +113,7 @@ namespace WHMCS\Database {
             return $r ? ($r->$c ?? null) : null;
         }
         public function pluck(string $c): Collection { return new Collection(array_column($this->rows(), $c)); }
+        public function sum(string $c) { return array_sum(array_column($this->rows(), $c)); }
         public function insert(array $row): bool
         {
             if ($this->table === 'mod_paymenthooks_events') {
@@ -114,6 +122,9 @@ namespace WHMCS\Database {
                         throw new \Illuminate\Database\QueryException('Duplicate entry', '23000');
                     }
                 }
+            }
+            if (!isset($row['id']) && in_array($this->table, ['mod_paymenthooks_subscriptions', 'mod_paymenthooks_refunds', 'mod_paymenthooks_sessions'], true)) {
+                $row['id'] = count(Capsule::$tables[$this->table]) + 1;
             }
             Capsule::$tables[$this->table][] = $row;
             return true;
@@ -174,16 +185,61 @@ namespace {
     function addInvoicePayment($invoiceId, $transId, $amount, $fee, $gateway)
     {
         $GLOBALS['payments'][] = compact('invoiceId', 'transId', 'amount', 'fee', 'gateway');
-        \WHMCS\Database\Capsule::$tables['tblaccounts'][] = ['transid' => $transId, 'gateway' => $gateway, 'invoiceid' => $invoiceId, 'amountin' => $amount];
-    }
-    function localAPI($cmd, $args)
-    {
-        foreach (\WHMCS\Database\Capsule::$tables['tblinvoices'] as $inv) {
-            if ($inv['id'] == $args['invoiceid']) {
-                return ['result' => 'success', 'balance' => $inv['total']];
+        $t = &\WHMCS\Database\Capsule::$tables;
+        $t['tblaccounts'][] = ['id' => count($t['tblaccounts']) + 1, 'transid' => $transId, 'gateway' => $gateway, 'invoiceid' => $invoiceId, 'amountin' => $amount, 'amountout' => 0, 'refundid' => 0];
+        foreach ($t['tblinvoices'] as &$inv) {
+            if ($inv['id'] == $invoiceId) {
+                $inv['paid'] = ($inv['paid'] ?? 0) + $amount;
+                if ($inv['paid'] + 0.001 >= $inv['total']) { $inv['status'] = 'Paid'; }
             }
         }
-        return ['result' => 'error', 'message' => 'not found'];
+    }
+    $GLOBALS['refunds'] = [];
+    function refundInvoicePayment($transId, $amount, $sendToGateway, $addAsCredit, $sendEmail, $refundTransId)
+    {
+        $GLOBALS['refunds'][] = compact('transId', 'amount', 'sendToGateway', 'refundTransId');
+        $t = &\WHMCS\Database\Capsule::$tables;
+        $t['tblaccounts'][] = ['id' => count($t['tblaccounts']) + 1, 'transid' => $refundTransId, 'gateway' => 'paymenthooks', 'invoiceid' => 0, 'amountin' => 0, 'amountout' => $amount, 'refundid' => $transId];
+        return 'manual';
+    }
+    $GLOBALS['api'] = [];
+    function localAPI($cmd, $args)
+    {
+        $GLOBALS['api'][] = [$cmd, $args];
+        $t = &\WHMCS\Database\Capsule::$tables;
+        if ($cmd === 'GetInvoice') {
+            foreach ($t['tblinvoices'] as $inv) {
+                if ($inv['id'] == $args['invoiceid']) {
+                    return ['result' => 'success', 'balance' => $inv['total'] - ($inv['paid'] ?? 0), 'total' => $inv['total']];
+                }
+            }
+            return ['result' => 'error', 'message' => 'not found'];
+        }
+        if ($cmd === 'GenInvoices') {
+            // WHMCS raises one renewal invoice for the due items it is asked about.
+            if (!empty($GLOBALS['genInvoicesFails'])) { return ['result' => 'error', 'message' => 'cron lock held']; }
+            if (!empty($GLOBALS['genInvoicesNoop'])) { return ['result' => 'success', 'latestinvoiceid' => 0]; }
+            $id = 3000 + count($t['tblinvoices']);
+            $total = 0;
+            $map = ['serviceids' => ['Hosting', 'tblhosting', 'amount'], 'domainids' => ['DomainRegister', 'tbldomains', 'recurringamount'], 'addonids' => ['Addon', 'tblhostingaddons', 'recurring']];
+            foreach ($map as $k => [$type, $table, $col]) {
+                foreach ($args[$k] ?? [] as $rel) {
+                    foreach ($t[$table] as $row) {
+                        if ($row['id'] == $rel) { $total += $row[$col]; }
+                    }
+                    $t['tblinvoiceitems'][] = ['invoiceid' => $id, 'type' => $type, 'relid' => $rel];
+                }
+            }
+            $t['tblinvoices'][] = ['id' => $id, 'userid' => 5, 'status' => 'Unpaid', 'total' => $total, 'notes' => ''];
+            return ['result' => 'success', 'latestinvoiceid' => $id];
+        }
+        if ($cmd === 'UpdateInvoice') {
+            foreach ($t['tblinvoices'] as &$inv) {
+                if ($inv['id'] == $args['invoiceid']) { $inv['notes'] = $args['notes']; return ['result' => 'success']; }
+            }
+            return ['result' => 'error', 'message' => 'not found'];
+        }
+        return ['result' => 'error', 'message' => 'unsupported ' . $cmd];
     }
 
     require __DIR__ . '/../modules/gateways/paymenthooks/lib/bootstrap.php';
@@ -194,7 +250,7 @@ namespace {
     $src = str_replace('die($body);', 'throw new HarnessResponse($status, $body);', $src);
     eval('use WHMCS\Database\Capsule; use PaymentHooks\Config; use PaymentHooks\Client; use PaymentHooks\ApiException;'
         . ' use PaymentHooks\Logger; use PaymentHooks\GatewayLog; use PaymentHooks\Signature; use PaymentHooks\Schema;'
-        . ' use PaymentHooks\InvoiceMapper; use PaymentHooks\CheckoutBuilder; use PaymentHooks\PriceResolver;'
+        . ' use PaymentHooks\InvoiceMapper; use PaymentHooks\CheckoutBuilder; use PaymentHooks\InvoicePlan;'
         . ' use PaymentHooks\WebhookRouter; ' . $src);
 
     class HarnessResponse extends \Exception
@@ -220,10 +276,19 @@ namespace {
             'tblhosting' => [['id' => 77, 'billingcycle' => 'Monthly', 'subscriptionid' => 'ph_sub_whmcs_1']],
             'tblaccounts' => [],
             'mod_paymenthooks_events' => [],
-            'mod_paymenthooks_sessions' => [['invoice_id' => 1001, 'session_id' => 'cs_whmcs_1', 'status' => 'open', 'fee_minor' => 2000]],
+            'mod_paymenthooks_sessions' => [['id' => 1, 'invoice_id' => 1001, 'session_id' => 'cs_whmcs_1', 'status' => 'open', 'fee_minor' => 2000, 'plan_json' => null]],
+            'mod_paymenthooks_subscriptions' => [],
+            'mod_paymenthooks_refunds' => [],
+            'tbldomains' => [],
+            'tblhostingaddons' => [],
         ];
+        \WHMCS\Database\Capsule::$withSubscriptionColumn = ['tblhosting', 'tbldomains', 'tblhostingaddons'];
         $GLOBALS['gatewayLog'] = [];
         $GLOBALS['payments'] = [];
+        $GLOBALS['refunds'] = [];
+        $GLOBALS['api'] = [];
+        $GLOBALS['genInvoicesFails'] = false;
+        $GLOBALS['genInvoicesNoop'] = false;
     }
 
     function deliver(string $body, string $secret): int
@@ -277,9 +342,36 @@ namespace {
 
     reset_db();
     \WHMCS\Database\Capsule::$tables['tblinvoices'][1]['status'] = 'Paid';
+    \WHMCS\Database\Capsule::$tables['tblhosting'][0] += ['nextduedate' => date('Y-m-d', time() + 86400), 'amount' => 499.00];
+    $GLOBALS['genInvoicesFails'] = true;
     $st = deliver(fx('subscription_renewed'), $secret);
-    ok('renewal before WHMCS invoice: 500 (redeliver) and logged', $st === 500 && (lastLog()['status'] ?? '') === 'Retry Requested', json_encode(lastLog()));
-    ok('renewal before invoice: claim released for redelivery', count(\WHMCS\Database\Capsule::$tables['mod_paymenthooks_events']) === 0);
+    ok('renewal, GenInvoices failing: 500 (redeliver) and logged as Error', $st === 500 && (lastLog()['status'] ?? '') === 'Error', json_encode(lastLog()));
+    ok('renewal, GenInvoices failing: claim released for redelivery', count(\WHMCS\Database\Capsule::$tables['mod_paymenthooks_events']) === 0);
+
+    reset_db();
+    \WHMCS\Database\Capsule::$tables['tblinvoices'][1]['status'] = 'Paid';
+    \WHMCS\Database\Capsule::$tables['tblhosting'][0] += ['nextduedate' => date('Y-m-d', time() + 86400), 'amount' => 499.00];
+    $st = deliver(fx('subscription_renewed'), $secret);
+    $gen = array_values(array_filter($GLOBALS['api'], function ($c) { return $c[0] === 'GenInvoices'; }));
+    ok('renewal before WHMCS invoice: WHMCS asked to raise it for exactly that service', count($gen) === 1 && ($gen[0][1]['serviceids'] ?? []) === [77] && !empty($gen[0][1]['noemails']), json_encode($gen));
+    ok('renewal before WHMCS invoice: charge recorded on the generated invoice', $st === 200 && ($GLOBALS['payments'][0]['invoiceId'] ?? 0) >= 3000
+        && (lastLog()['status'] ?? '') === 'Subscription Renewal Paid', json_encode(lastLog()));
+
+    reset_db();
+    \WHMCS\Database\Capsule::$tables['tblinvoices'][1]['status'] = 'Paid';
+    \WHMCS\Database\Capsule::$tables['tblhosting'][0] += ['nextduedate' => date('Y-m-d', time() + 20 * 86400)];
+    $st = deliver(fx('subscription_renewed'), $secret);
+    $gen = array_filter($GLOBALS['api'], function ($c) { return $c[0] === 'GenInvoices'; });
+    ok('renewal when WHMCS has the period paid and nothing due: Needs Attention, not applied, no invoice raised',
+        $st === 200 && (lastLog()['status'] ?? '') === 'Needs Attention' && !$GLOBALS['payments'] && !$gen, json_encode(lastLog()));
+
+    reset_db();
+    \WHMCS\Database\Capsule::$tables['tblinvoices'][1]['status'] = 'Paid';
+    \WHMCS\Database\Capsule::$tables['tblhosting'][0] += ['nextduedate' => date('Y-m-d', time() + 86400), 'amount' => 499.00];
+    $GLOBALS['genInvoicesNoop'] = true;
+    $st = deliver(fx('subscription_renewed'), $secret);
+    ok('renewal due but WHMCS raised no invoice: 500 Retry Requested, nothing applied', $st === 500 && (lastLog()['status'] ?? '') === 'Retry Requested'
+        && !$GLOBALS['payments'] && count(\WHMCS\Database\Capsule::$tables['mod_paymenthooks_events']) === 0, json_encode(lastLog()));
 
     reset_db();
     $st = deliver(fx('subscription_renewed_credit'), $secret);
@@ -287,18 +379,155 @@ namespace {
 
     reset_db();
     $st = deliver(fx('subscription_cancelled'), $secret);
-    ok('cancelled: logged and service unbound', $st === 200 && (lastLog()['status'] ?? '') === 'Subscription Cancelled'
+    ok('cancelled (legacy binding): logged and service unbound', $st === 200 && (lastLog()['status'] ?? '') === 'Subscription Cancelled'
         && \WHMCS\Database\Capsule::$tables['tblhosting'][0]['subscriptionid'] === '');
 
+    echo "Subscribe & Auto-pay: hosting + domain + addon\n";
+    function reset_subscribed(): void
+    {
+        reset_db();
+        $t = &\WHMCS\Database\Capsule::$tables;
+        $soon = date('Y-m-d', time() + 86400);
+        $t['tblhosting'] = [['id' => 77, 'billingcycle' => 'Monthly', 'amount' => 1000.00, 'subscriptionid' => '', 'nextduedate' => $soon]];
+        $t['tbldomains'] = [['id' => 12, 'registrationperiod' => 1, 'recurringamount' => 800.00, 'subscriptionid' => '', 'nextduedate' => $soon]];
+        $t['tblhostingaddons'] = [['id' => 5, 'billingcycle' => 'Monthly', 'recurring' => 200.00, 'subscriptionid' => '', 'nextduedate' => $soon]];
+        $t['tblinvoices'] = [['id' => 1002, 'userid' => 5, 'status' => 'Unpaid', 'total' => 499.00]];
+        $t['tblinvoiceitems'] = [['invoiceid' => 1002, 'type' => 'Hosting', 'relid' => 77], ['invoiceid' => 1002, 'type' => 'Addon', 'relid' => 5]];
+        $t['mod_paymenthooks_sessions'] = [['id' => 1, 'invoice_id' => 1002, 'session_id' => 'cs_whmcs_2', 'status' => 'open', 'fee_minor' => 0,
+            'plan_json' => json_encode(['subscribed' => [
+                ['relType' => 'hosting', 'relId' => 77, 'renewalMinor' => 100000, 'interval' => 'month', 'intervalCount' => 1, 'description' => 'Starter'],
+                ['relType' => 'addon', 'relId' => 5, 'renewalMinor' => 20000, 'interval' => 'month', 'intervalCount' => 1, 'description' => 'Backups'],
+            ]])]];
+    }
+    function rows(string $table): array { return array_values(\WHMCS\Database\Capsule::$tables[$table]); }
+
+    reset_subscribed();
+    $st = deliver(fx('checkout_session_completed_subscription'), $secret);
+    $subs = rows('mod_paymenthooks_subscriptions');
+    ok('first payment: 200, recorded', $st === 200 && ($GLOBALS['payments'][0]['transId'] ?? '') === 'ph_pay_whmcs_2', json_encode(lastLog()));
+    ok('first payment: hosting and addon bound to the subscription', count($subs) === 2
+        && $subs[0]['rel_type'] === 'hosting' && $subs[1]['rel_type'] === 'addon' && $subs[1]['subscription_id'] === 'ph_sub_whmcs_1', json_encode($subs));
+    ok('first payment: id mirrored on tblhosting and tblhostingaddons', rows('tblhosting')[0]['subscriptionid'] === 'ph_sub_whmcs_1'
+        && rows('tblhostingaddons')[0]['subscriptionid'] === 'ph_sub_whmcs_1');
+    ok('first payment: domain (other cycle) not bound', rows('tbldomains')[0]['subscriptionid'] === '');
+
+    // Renewal of 1,200.00 (hosting 1,000 + addon 200), WHMCS raised one combined renewal invoice.
+    $t = &\WHMCS\Database\Capsule::$tables;
+    $t['tblinvoices'][] = ['id' => 2001, 'userid' => 5, 'status' => 'Unpaid', 'total' => 1200.00];
+    $t['tblinvoiceitems'][] = ['invoiceid' => 2001, 'type' => 'Hosting', 'relid' => 77];
+    $t['tblinvoiceitems'][] = ['invoiceid' => 2001, 'type' => 'Addon', 'relid' => 5];
+    $ev = json_decode(fx('subscription_renewed'), true);
+    $ev['id'] = 'evt_multi_renew';
+    $ev['data']['object']['latest_payment'] = ['id' => 'ph_pay_multi_1', 'amount' => 120000, 'currency' => 'inr'];
+    $GLOBALS['payments'] = [];
+    $st = deliver(json_encode($ev), $secret);
+    ok('multi-item renewal: one payment on the combined renewal invoice', $st === 200 && count($GLOBALS['payments']) === 1
+        && $GLOBALS['payments'][0]['invoiceId'] === 2001 && $GLOBALS['payments'][0]['amount'] == 1200.0
+        && (lastLog()['status'] ?? '') === 'Subscription Renewal Paid', json_encode([$GLOBALS['payments'], lastLog()]));
+
+    $inv = ['id' => 'evt_inv_paid', 'type' => 'invoice.paid', 'livemode' => false, 'data' => ['object' => ['id' => 'ph_inv_7', 'object' => 'invoice',
+        'subscription' => 'ph_sub_whmcs_1', 'payment_intent' => 'ph_pay_multi_1', 'amount_paid' => 120000, 'currency' => 'inr', 'billing_reason' => 'subscription_cycle']]];
+    $st = deliver(json_encode($inv), $secret);
+    ok('invoice.paid for the same renewal: Duplicate, applied once', $st === 200 && (lastLog()['status'] ?? '') === 'Duplicate' && count($GLOBALS['payments']) === 1, json_encode(lastLog()));
+
+    // Next cycle: WHMCS raised separate invoices for hosting and addon.
+    $t['tblinvoices'][] = ['id' => 2010, 'userid' => 5, 'status' => 'Unpaid', 'total' => 1000.00];
+    $t['tblinvoices'][] = ['id' => 2011, 'userid' => 5, 'status' => 'Unpaid', 'total' => 200.00];
+    $t['tblinvoiceitems'][] = ['invoiceid' => 2010, 'type' => 'Hosting', 'relid' => 77];
+    $t['tblinvoiceitems'][] = ['invoiceid' => 2011, 'type' => 'Addon', 'relid' => 5];
+    $inv['id'] = 'evt_inv_paid_2';
+    $inv['data']['object']['payment_intent'] = 'ph_pay_multi_2';
+    $GLOBALS['payments'] = [];
+    $st = deliver(json_encode($inv), $secret);
+    ok('invoice.paid renewal split over separate WHMCS invoices', $st === 200 && count($GLOBALS['payments']) === 2
+        && $GLOBALS['payments'][0]['invoiceId'] === 2010 && $GLOBALS['payments'][0]['amount'] == 1000.0
+        && $GLOBALS['payments'][1]['invoiceId'] === 2011 && $GLOBALS['payments'][1]['amount'] == 200.0, json_encode($GLOBALS['payments']));
+
+    $inv['id'] = 'evt_inv_foreign';
+    $inv['data']['object']['subscription'] = 'ph_sub_elsewhere';
+    $inv['data']['object']['payment_intent'] = 'ph_pay_foreign';
+    $st = deliver(json_encode($inv), $secret);
+    ok('invoice.paid for a subscription not bound here: Ignored', $st === 200 && (lastLog()['status'] ?? '') === 'Ignored', json_encode(lastLog()));
+
+    // Renewal failed: note on the unpaid renewal invoice, nothing charged.
+    $t['tblinvoices'][] = ['id' => 2020, 'userid' => 5, 'status' => 'Unpaid', 'total' => 1200.00, 'notes' => 'existing note'];
+    $t['tblinvoiceitems'][] = ['invoiceid' => 2020, 'type' => 'Hosting', 'relid' => 77];
+    $ev = json_decode(fx('subscription_renewed'), true);
+    $ev['id'] = 'evt_fail';
+    $ev['type'] = 'subscription.renewal_failed';
+    unset($ev['data']['object']['latest_payment']);
+    $ev['data']['object']['failure_reason'] = 'Card declined';
+    $GLOBALS['payments'] = [];
+    $st = deliver(json_encode($ev), $secret);
+    $notes = '';
+    foreach (rows('tblinvoices') as $r) { if ($r['id'] === 2020) { $notes = $r['notes']; } }
+    ok('renewal failed: 200, logged Failure, nothing charged', $st === 200 && (lastLog()['status'] ?? '') === 'Failure' && !$GLOBALS['payments'], json_encode(lastLog()));
+    ok('renewal failed: note appended to the renewal invoice', strpos($notes, 'existing note') === 0 && strpos($notes, 'Card declined') !== false, $notes);
+    ok('renewal failed: invoice stays Unpaid for WHMCS overdue handling', rows('tblinvoices')[count(rows('tblinvoices')) - 1]['status'] === 'Unpaid');
+
+    // Cancelled at PaymentHooks: every bound item unbound.
+    $st = deliver(fx('subscription_cancelled'), $secret);
+    $subs = rows('mod_paymenthooks_subscriptions');
+    ok('cancelled: logged', $st === 200 && (lastLog()['status'] ?? '') === 'Subscription Cancelled', json_encode(lastLog()));
+    ok('cancelled: all items marked cancelled and ids cleared', $subs[0]['status'] === 'cancelled' && $subs[1]['status'] === 'cancelled'
+        && rows('tblhosting')[0]['subscriptionid'] === '' && rows('tblhostingaddons')[0]['subscriptionid'] === '', json_encode($subs));
+    $ev = json_decode(fx('subscription_renewed'), true);
+    $ev['id'] = 'evt_after_cancel';
+    $ev['data']['object']['latest_payment'] = ['id' => 'ph_pay_after', 'amount' => 120000, 'currency' => 'inr'];
+    $GLOBALS['payments'] = [];
+    $st = deliver(json_encode($ev), $secret);
+    ok('renewal after cancellation: Needs Attention, not applied', $st === 200 && (lastLog()['status'] ?? '') === 'Needs Attention' && !$GLOBALS['payments']);
+
+    reset_subscribed();
+    \WHMCS\Database\Capsule::$withSubscriptionColumn = ['tblhosting'];
+    deliver(fx('checkout_session_completed_subscription'), $secret);
+    ok('WHMCS without addon subscriptionid column: bound in the module table only', count(rows('mod_paymenthooks_subscriptions')) === 2
+        && rows('tblhostingaddons')[0]['subscriptionid'] === '' && rows('tblhosting')[0]['subscriptionid'] === 'ph_sub_whmcs_1');
+    $ev = json_decode(fx('subscription_cancelled'), true);
+    $ev['type'] = 'subscription.deleted';
+    $ev['id'] = 'evt_deleted';
+    $st = deliver(json_encode($ev), $secret);
+    ok('subscription.deleted unbinds like cancelled', $st === 200 && rows('mod_paymenthooks_subscriptions')[0]['status'] === 'cancelled');
+
+    echo "Refunds made at PaymentHooks\n";
     reset_db();
     $st = deliver(fx('payment_refunded'), $secret);
     ok('refund of unknown payment: logged as Ignored', $st === 200 && (lastLog()['status'] ?? '') === 'Ignored');
     deliver(fx('checkout_session_completed'), $secret);
-    // A distinct refund event (the earlier one was already processed).
     $ev = json_decode(fx('payment_refunded'), true);
     $ev['id'] = 'evt_whmcs_refunded_2';
     $st = deliver(json_encode($ev), $secret);
-    ok('refund of recorded payment: logged as Refund Notification', $st === 200 && (lastLog()['status'] ?? '') === 'Refund Notification', json_encode(lastLog()));
+    ok('dashboard refund: recorded in WHMCS against the payment', $st === 200 && count($GLOBALS['refunds']) === 1
+        && $GLOBALS['refunds'][0]['amount'] == 500.0 && $GLOBALS['refunds'][0]['sendToGateway'] === false
+        && (lastLog()['status'] ?? '') === 'Refund Notification', json_encode([$GLOBALS['refunds'], lastLog()]));
+    $ev['id'] = 'evt_whmcs_refunded_3';
+    $st = deliver(json_encode($ev), $secret);
+    ok('same cumulative refund again: not booked twice', $st === 200 && count($GLOBALS['refunds']) === 1, json_encode($GLOBALS['refunds']));
+    $ev['id'] = 'evt_whmcs_refunded_4';
+    $ev['data']['object']['charges']['data'][0]['amount_refunded'] = 80000;
+    $st = deliver(json_encode($ev), $secret);
+    ok('second dashboard refund: only the increase (300.00) booked', $st === 200 && count($GLOBALS['refunds']) === 2 && $GLOBALS['refunds'][1]['amount'] == 300.0, json_encode($GLOBALS['refunds']));
+    $ev['id'] = 'evt_whmcs_refunded_5';
+    $ev['data']['object']['charges']['data'][0]['amount_refunded'] = 102000;
+    $st = deliver(json_encode($ev), $secret);
+    ok('full refund incl. convenience fee: WHMCS refunds what it credited, rest flagged', $st === 200 && count($GLOBALS['refunds']) === 3
+        && $GLOBALS['refunds'][2]['amount'] == 200.0 && (lastLog()['status'] ?? '') === 'Needs Attention', json_encode([$GLOBALS['refunds'], lastLog()]));
+
+    reset_db();
+    deliver(fx('checkout_session_completed'), $secret);
+    \PaymentHooks\RefundSync::reserveWhmcsRefund('ph_pay_whmcs_1', 50000);
+    $ev = json_decode(fx('payment_refunded'), true);
+    $ev['id'] = 'evt_refund_from_whmcs';
+    $st = deliver(json_encode($ev), $secret);
+    ok('refund issued from WHMCS: its webhook is not booked again', $st === 200 && !$GLOBALS['refunds'] && (lastLog()['status'] ?? '') === 'Refund Notification', json_encode(lastLog()));
+
+    reset_db();
+    deliver(fx('checkout_session_completed'), $secret);
+    \WHMCS\Database\Capsule::$tables['tblcurrencies'][1]['code'] = 'USD';
+    $ev = json_decode(fx('payment_refunded'), true);
+    $ev['id'] = 'evt_refund_currency';
+    $st = deliver(json_encode($ev), $secret);
+    ok('refund in another currency: Needs Attention, not booked', $st === 200 && !$GLOBALS['refunds'] && (lastLog()['status'] ?? '') === 'Needs Attention');
 
     reset_db();
     $ev = json_decode(fx('checkout_session_completed'), true);

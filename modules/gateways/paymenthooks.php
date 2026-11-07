@@ -25,7 +25,12 @@ use PaymentHooks\Client;
 use PaymentHooks\Logger;
 use PaymentHooks\Schema;
 use PaymentHooks\InvoiceMapper;
+use PaymentHooks\InvoicePlan;
+use PaymentHooks\PayButton;
 use PaymentHooks\RefundMapper;
+use PaymentHooks\RefundSync;
+use PaymentHooks\SubscriptionMap;
+use PaymentHooks\SubscriptionSync;
 
 /**
  * Module metadata and capability flags.
@@ -37,7 +42,9 @@ function paymenthooks_MetaData()
         'APIVersion'                  => '1.1',
         // Cards are entered on the PH hosted page, never inside WHMCS.
         'DisableLocalCreditCardInput' => true,
-        // PH has no off-session charge API, so WHMCS stores no tokens.
+        // PaymentHooks holds the mandate and charges every renewal itself;
+        // WHMCS stores no tokens and has no capture function, so WHMCS can
+        // never be the one that triggers a charge.
         'TokenisedStorage'            => false,
     ];
 }
@@ -84,7 +91,8 @@ function paymenthooks_config()
             'Default'      => $webhookUrl,
             'Description'  => 'Read-only. Add this URL as a webhook endpoint in PaymentHooks, subscribed to '
                 . 'checkout.session.completed, checkout.session.payment_failed, payment.refunded, '
-                . 'subscription.renewed, subscription.renewal_failed and subscription.cancelled.',
+                . 'subscription.renewed, subscription.renewal_failed, subscription.cancelled, '
+                . 'subscription.deleted and invoice.paid.',
         ],
         'customDomain' => [
             'FriendlyName' => 'Custom Checkout Domain',
@@ -142,19 +150,16 @@ function paymenthooks_config()
         'enableSubscriptions' => [
             'FriendlyName' => 'Enable Subscriptions',
             'Type'         => 'yesno',
-            'Description'  => 'Tick to let recurring products start a PaymentHooks subscription at checkout.',
+            'Description'  => 'Tick to show a "Subscribe & Auto-pay" button next to Pay Now on invoices with hosting, '
+                . 'domains or addons. The client chooses; PaymentHooks then charges every renewal itself and WHMCS '
+                . 'records it from the webhook.',
         ],
-        'paymentModePolicy' => [
-            'FriendlyName' => 'Payment Mode',
-            'Type'         => 'dropdown',
-            'Options'      => [
-                'auto'         => 'Auto — subscription for recurring products, one-time otherwise',
-                'subscription' => 'Subscription only — every invoice must contain a recurring product',
-                'payment'      => 'One-time only — never start a subscription',
-            ],
-            'Default'      => 'auto',
-            'Description'  => '"Subscription only" requires Enable Subscriptions; an invoice without a recurring '
-                . 'product then fails at checkout instead of being charged once.',
+        'subscribeButtonText' => [
+            'FriendlyName' => 'Subscribe Button Text',
+            'Type'         => 'text',
+            'Size'         => '30',
+            'Default'      => 'Subscribe & Auto-pay',
+            'Description'  => 'Label of the subscription button.',
         ],
         'logging' => [
             'FriendlyName' => 'Debug Logging',
@@ -165,54 +170,52 @@ function paymenthooks_config()
 }
 
 /**
- * Renders the "Pay Now" button on the invoice. The button posts to the
- * callback, which creates the PH checkout session on click, so viewing an
- * invoice never creates a session.
+ * Renders the invoice payment block: "Pay Now" always, and "Subscribe &
+ * Auto-pay" next to it when subscriptions are enabled and the invoice has an
+ * item that can renew automatically. Both post to the callback, which creates
+ * the PH checkout session on click, so viewing an invoice never creates one.
  */
 function paymenthooks_link($params)
 {
     Schema::ensure();
 
-    $problems = Config::fromParams($params)->validate();
+    $config = Config::fromParams($params);
+    $problems = $config->validate();
     if ($problems) {
         (new Logger('paymenthooks', true))->error('config', [], implode(' ', $problems));
         return '<div class="alert alert-danger" id="paymenthooks_pay_unavailable">'
             . 'Online payment is unavailable. Please contact us.</div>';
     }
 
-    $systemUrl  = rtrim($params['systemurl'], '/');
-    $actionUrl  = $systemUrl . '/modules/gateways/callback/paymenthooks.php';
-    $invoiceId  = (int) $params['invoiceid'];
-    $buttonText = htmlspecialchars($params['langpaynow'] ?? 'Pay Now', ENT_QUOTES);
+    $systemUrl = rtrim($params['systemurl'], '/');
+    $invoiceId = (int) $params['invoiceid'];
+    $currency  = strtoupper((string) ($params['currency'] ?? ''));
+
+    $plan = null;
+    if ($config->subscriptionsEnabled && $currency !== '') {
+        try {
+            $plan = InvoicePlan::forInvoice($invoiceId, $currency);
+        } catch (\Throwable $e) {
+            // Pay Now still works; the reason the Subscribe button is missing is logged.
+            (new Logger('paymenthooks', $config->logging))->error('subscribe-plan', ['invoice_id' => $invoiceId], get_class($e) . ': ' . $e->getMessage());
+        }
+    }
 
     $logoUrl = trim($params['logoUrl'] ?? '');
     if ($logoUrl === '' && is_file(__DIR__ . '/paymenthooks/logo.png')) {
         $logoUrl = $systemUrl . '/modules/gateways/paymenthooks/logo.png';
     }
-    $heading = trim($params['checkoutHeading'] ?? '');
-    $blurb   = trim($params['checkoutBlurb'] ?? '');
 
-    $logoHtml = $logoUrl !== ''
-        ? '<div class="paymenthooks-logo" id="paymenthooks_pay_logo" style="margin-bottom:10px"><img src="'
-            . htmlspecialchars($logoUrl, ENT_QUOTES) . '" alt="PaymentHooks" style="max-height:40px"></div>'
-        : '';
-    $headingHtml = $heading !== ''
-        ? '<div class="paymenthooks-heading" id="paymenthooks_pay_heading" style="font-weight:600;margin-bottom:4px">'
-            . htmlspecialchars($heading, ENT_QUOTES) . '</div>'
-        : '';
-    $blurbHtml = $blurb !== ''
-        ? '<div class="paymenthooks-blurb" id="paymenthooks_pay_blurb" style="color:#666;margin-bottom:10px">'
-            . nl2br(htmlspecialchars($blurb, ENT_QUOTES)) . '</div>'
-        : '';
-
-    $tpl = file_get_contents(__DIR__ . '/paymenthooks/templates/pay_button.tpl');
-    return strtr($tpl, [
-        '{logo_html}'    => $logoHtml,
-        '{heading_html}' => $headingHtml,
-        '{blurb_html}'   => $blurbHtml,
-        '{action_url}'   => htmlspecialchars($actionUrl, ENT_QUOTES),
-        '{invoice_id}'   => $invoiceId,
-        '{button_text}'  => $buttonText,
+    return PayButton::render((string) file_get_contents(__DIR__ . '/paymenthooks/templates/pay_button.tpl'), [
+        'actionUrl'     => $systemUrl . '/modules/gateways/callback/paymenthooks.php',
+        'invoiceId'     => $invoiceId,
+        'payText'       => (string) ($params['langpaynow'] ?? 'Pay Now'),
+        'subscribeText' => (string) ($params['subscribeButtonText'] ?? ''),
+        'logoUrl'       => $logoUrl,
+        'heading'       => (string) ($params['checkoutHeading'] ?? ''),
+        'blurb'         => (string) ($params['checkoutBlurb'] ?? ''),
+        'currency'      => $currency,
+        'plan'          => $plan,
     ]);
 }
 
@@ -262,6 +265,9 @@ function paymenthooks_refund($params)
     }
     $body = RefundMapper::body($amountUsdCents, 'Refund issued from WHMCS for invoice ' . ($params['invoiceid'] ?? ''));
 
+    // Reserved before the call, so this refund's own payment.refunded webhook
+    // (which can arrive before WHMCS saves the refund) is not booked again.
+    $reservation = RefundSync::reserveWhmcsRefund($paymentId, $amountMinor);
     try {
         $resp = $client->post(
             '/payments/' . rawurlencode($paymentId) . '/refund',
@@ -269,19 +275,25 @@ function paymenthooks_refund($params)
             'refund-' . $paymentId . '-' . $amountMinor . '-' . $refundsSoFar
         );
     } catch (ApiException $e) {
+        RefundSync::releaseWhmcsRefund($reservation);
         return ['status' => 'declined', 'rawdata' => $e->errorCode . ': ' . $e->getMessage()];
     }
 
     $refundId = (string) ($resp['data']['id'] ?? '');
     if ($refundId === '') {
+        $logger->error('refund-response', compact('paymentId', 'amountMinor'), 'PaymentHooks returned no refund id; check the payment in PaymentHooks before retrying.');
         return ['status' => 'error', 'rawdata' => $resp];
     }
+    RefundSync::confirmWhmcsRefund($reservation, $refundId);
     return ['status' => 'success', 'transid' => $refundId, 'rawdata' => $resp];
 }
 
 /**
  * Cancels the PH subscription when the WHMCS service is cancelled or
- * terminated. WHMCS passes the id stored on tblhosting.subscriptionid.
+ * terminated (or the admin clicks Cancel Subscription). WHMCS passes the id
+ * mirrored on the item's subscriptionid. One subscription can renew several
+ * items (hosting, its domain, addons): it is cancelled for all of them, and
+ * the others then renew through their WHMCS invoices.
  */
 function paymenthooks_cancelSubscription($params)
 {
@@ -304,10 +316,17 @@ function paymenthooks_cancelSubscription($params)
     } catch (ApiException $e) {
         // Already cancelled at PaymentHooks (e.g. from its dashboard).
         if ($e->errorCode === 'INVALID_STATE' && $e->httpStatus === 422) {
+            SubscriptionMap::unbind($subscriptionId);
             return ['status' => 'success', 'rawdata' => $e->response];
         }
+        $logger->error('cancel-subscription', ['subscriptionId' => $subscriptionId], $e->errorCode . ': ' . $e->getMessage(), [$config->secretKey]);
         return ['status' => 'error', 'rawdata' => $e->errorCode . ': ' . $e->getMessage()];
     }
 
+    $items = SubscriptionMap::unbind($subscriptionId);
+    if (count($items) > 1) {
+        logActivity('PaymentHooks: subscription ' . $subscriptionId . ' cancelled; it also auto-renewed '
+            . SubscriptionSync::describe($items) . ', which now renew through their WHMCS invoices.');
+    }
     return ['status' => 'success', 'rawdata' => $resp];
 }
