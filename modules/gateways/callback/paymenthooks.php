@@ -362,12 +362,10 @@ function resolve_customer_id(Client $client, int $userId): string
     $email = $body['email'];
 
     try {
-        $resp = $client->post('/customers', $body);
-        $id = (string) ($resp['data']['id'] ?? '');
-        if ($id === '') {
-            throw new ApiException('PaymentHooks returned no customer id.', 'UNEXPECTED_RESPONSE');
+        $id = create_customer($client, $body, $userId);
+        if ($id !== null) {
+            return $id;
         }
-        return $id;
     } catch (ApiException $e) {
         if ($e->errorCode !== 'DUPLICATE_EMAIL') {
             throw $e;
@@ -380,13 +378,59 @@ function resolve_customer_id(Client $client, int $userId): string
         if (strcasecmp((string) ($customer['email'] ?? ''), $email) === 0 && !empty($customer['id'])) {
             // Fill in a phone WHMCS has and PaymentHooks lacks, so checkout
             // does not ask the client for it. Never overwrite a stored value.
+            // A phone PaymentHooks refuses (not valid for its country) is
+            // logged and left out: checkout then asks the client for it.
             if (isset($body['phone']) && trim((string) ($customer['phone'] ?? '')) === '') {
-                $client->put('/customers/' . rawurlencode((string) $customer['id']), ['phone' => $body['phone']]);
+                try {
+                    $client->put('/customers/' . rawurlencode((string) $customer['id']), ['phone' => $body['phone']]);
+                } catch (ApiException $e) {
+                    if (!is_phone_refusal($e)) {
+                        throw $e;
+                    }
+                    log_phone_refusal($userId, $e);
+                }
             }
             return (string) $customer['id'];
         }
     }
     throw new ApiException('PaymentHooks reported a duplicate email but the customer could not be found.', 'CUSTOMER_LOOKUP_FAILED');
+}
+
+/**
+ * POST /customers. PaymentHooks validates the phone for its country; when it
+ * refuses only the phone (a value WHMCS accepted, e.g. too short), the client
+ * is created without it and checkout asks for the number. Returns null on
+ * DUPLICATE_EMAIL (rethrown for the caller), the new id otherwise.
+ *
+ * @throws ApiException
+ */
+function create_customer(Client $client, array $body, int $userId): ?string
+{
+    try {
+        $resp = $client->post('/customers', $body);
+    } catch (ApiException $e) {
+        if (!isset($body['phone']) || !is_phone_refusal($e)) {
+            throw $e;
+        }
+        log_phone_refusal($userId, $e);
+        unset($body['phone']);
+        $resp = $client->post('/customers', $body);
+    }
+    $id = (string) ($resp['data']['id'] ?? '');
+    if ($id === '') {
+        throw new ApiException('PaymentHooks returned no customer id.', 'UNEXPECTED_RESPONSE');
+    }
+    return $id;
+}
+
+function is_phone_refusal(ApiException $e): bool
+{
+    return CheckoutBuilder::isPhoneRefusal($e->errorCode, $e->response);
+}
+
+function log_phone_refusal(int $userId, ApiException $e): void
+{
+    logModuleCall('paymenthooks', 'customer phone not accepted', ['clientId' => $userId], $e->getMessage(), '', []);
 }
 
 function redirect_to_invoice(int $invoiceId, string $flag): void

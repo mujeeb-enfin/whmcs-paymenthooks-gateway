@@ -2,7 +2,7 @@
     "schema": "1.0",
     "type": "whmcs-gateways",
     "name": "paymenthooks",
-    "version": "3.1.1",
+    "version": "3.1.2",
     "license": "MIT",
     "category": "gateway",
     "description": {

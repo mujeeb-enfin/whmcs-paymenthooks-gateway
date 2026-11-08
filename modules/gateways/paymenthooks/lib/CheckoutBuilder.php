@@ -209,6 +209,19 @@ class CheckoutBuilder
         return $body;
     }
 
+    /**
+     * A 400 VALIDATION_ERROR naming only the phone: PaymentHooks did not accept
+     * the client's number for its country (it validates worldwide numbering
+     * plans). The customer is then created without it and checkout asks.
+     *
+     * @param array $response decoded error body
+     */
+    public static function isPhoneRefusal(string $errorCode, array $response): bool
+    {
+        $fields = $response['error']['fields'] ?? null;
+        return $errorCode === 'VALIDATION_ERROR' && is_array($fields) && array_keys($fields) === ['phone'];
+    }
+
     public static function convenienceFeeMinor(Config $config, int $subtotalMinor): int
     {
         if ($config->convenienceFeePercent === null || $config->convenienceFeePercent <= 0) {

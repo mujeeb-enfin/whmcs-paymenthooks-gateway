@@ -83,6 +83,14 @@ are kept. Tables are upgraded automatically on the next request:
 | `mod_paymenthooks_price_map` | Earlier versions' product/price cache; no longer written | `currency`, `amount_minor` |
 | `mod_paymenthooks_install` | A random id for this install, used in idempotency keys | new table |
 
+### Phone numbers checked worldwide (3.1.1 to 3.1.2)
+
+Replace all files; there is no table change. PaymentHooks (from 2026-11-08) validates a customer's phone
+against the numbering plan of its country and stores it in E.164. WHMCS formats such as `+91.9746102494`
+are accepted. When PaymentHooks refuses only the client's phone (not a valid number for its country), 3.1.2
+creates the customer without it, writes `customer phone not accepted` to the Module Log, and checkout asks
+the client for the number. 3.1.1 stopped such a checkout with `paymentfailed`.
+
 ### Discounted first periods and mixed cycles (3.1.0 to 3.1.1)
 
 Replace all files; there is no table change (`plan_json` now also stores the billing groups). What changes
@@ -210,6 +218,13 @@ it), and on a part-paid or credit-applied invoice each row is scaled to its shar
 when the rows cannot add up to the balance exactly (for example a negative line not tied to an item,
 since PaymentHooks line items cannot be negative) is one line "Invoice #N" for the balance sent, and
 the reason is written to the Activity Log as `PaymentHooks info [checkout-single-line]`.
+
+The client's name, email, phone and country are sent with the PaymentHooks customer, so checkout does not
+ask for them again. PaymentHooks validates the phone against the numbering plan of its country (worldwide;
+WHMCS formats such as `+91.9746102494` are accepted) and stores it in E.164; checkout shows it as a country
+selector and the number. If PaymentHooks refuses only the phone (not a valid number for its country), the
+customer is created without it, the Module Log has `customer phone not accepted`, and checkout asks the
+client for the number.
 
 Checkout stops with an error, instead of charging a different amount, when:
 

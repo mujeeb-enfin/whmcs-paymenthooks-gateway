@@ -415,5 +415,12 @@ $threw = false;
 try { CheckoutBuilder::customerBody(['firstname' => 'A']); } catch (\InvalidArgumentException $e) { $threw = true; }
 same('client without email is refused', true, $threw);
 
+echo "Phone refusal\n";
+same('a refusal naming only the phone is a phone refusal', true,
+    CheckoutBuilder::isPhoneRefusal('VALIDATION_ERROR', ['error' => ['fields' => ['phone' => 'Enter a valid phone number for India.']]]));
+same('a refusal naming other fields too is not', false,
+    CheckoutBuilder::isPhoneRefusal('VALIDATION_ERROR', ['error' => ['fields' => ['phone' => 'x', 'email' => 'y']]]));
+same('another error code is not', false, CheckoutBuilder::isPhoneRefusal('DUPLICATE_EMAIL', []));
+
 echo "\n{$count} checks, {$failures} failed\n";
 exit($failures === 0 ? 0 : 1);
