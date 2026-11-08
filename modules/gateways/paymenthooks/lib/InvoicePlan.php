@@ -79,7 +79,7 @@ class InvoicePlan
 
         $rows = [];
         foreach (self::netPromotions($lines) as $line) {
-            $rows[] = $line + self::recurringFor($line['type'], $line['relId'], $currency);
+            $rows[] = $line + self::recurringFor($line['type'], $line['relId'], $currency) + self::catalogFor($line['type'], $line['relId']);
         }
         $rows = self::allocateTax($rows, $taxMinor, $totalMinor);
         $balance = InvoiceMapper::balanceDetail($invoiceId, $currency);
@@ -152,6 +152,58 @@ class InvoicePlan
                 'periodStart' => self::ymd((string) ($row->nextduedate ?? ''))];
         }
         return $none;
+    }
+
+    /**
+     * The catalog item a line renews as, the same for every client (WHMCS
+     * product / addon / TLD, never the client's domain or service):
+     *   Hosting   hosting_<tblproducts.id>   named after the product
+     *   Addon     addon_<tbladdons.id>       named after the addon
+     *   Domain    <tld>_domain_registration | _renewal | _transfer, by the
+     *             invoice item type (DomainRegister / Domain / DomainTransfer)
+     *
+     * @return array{productKey?: string, productName?: string}
+     */
+    private static function catalogFor(string $type, int $relId): array
+    {
+        if ($relId <= 0) {
+            return [];
+        }
+        if ($type === 'Hosting') {
+            $pid = (int) (Capsule::table('tblhosting')->where('id', $relId)->value('packageid') ?? 0);
+            $name = $pid > 0 ? (string) (Capsule::table('tblproducts')->where('id', $pid)->value('name') ?? '') : '';
+            return $pid > 0 ? ['productKey' => 'hosting_' . $pid] + ($name !== '' ? ['productName' => $name] : []) : [];
+        }
+        if ($type === 'Addon') {
+            $aid = (int) (Capsule::table('tblhostingaddons')->where('id', $relId)->value('addonid') ?? 0);
+            $name = $aid > 0 ? (string) (Capsule::table('tbladdons')->where('id', $aid)->value('name') ?? '') : '';
+            return $aid > 0 ? ['productKey' => 'addon_' . $aid] + ($name !== '' ? ['productName' => $name] : []) : [];
+        }
+        if (in_array($type, self::DOMAIN_TYPES, true)) {
+            $domain = (string) (Capsule::table('tbldomains')->where('id', $relId)->value('domain') ?? '');
+            return self::domainCatalog($type, $domain);
+        }
+        return [];
+    }
+
+    /**
+     * Pure (unit-tested): the catalog key and name of a domain line from its
+     * invoice item type and the domain, keyed by TLD only ("orivanuts.com"
+     * renewal -> com_domain_renewal / ".com domain renewal"; "x.co.uk" ->
+     * co_uk_domain_registration). The domain name itself never leaves here.
+     *
+     * @return array{productKey?: string, productName?: string}
+     */
+    public static function domainCatalog(string $type, string $domain): array
+    {
+        $dot = strpos($domain, '.');
+        $tld = $dot === false ? '' : strtolower(substr($domain, $dot + 1));
+        if ($tld === '' || !preg_match('/^[a-z0-9][a-z0-9.-]*$/', $tld)) {
+            return [];
+        }
+        $action = $type === 'DomainRegister' ? 'registration' : ($type === 'DomainTransfer' ? 'transfer' : 'renewal');
+        $key = substr(str_replace(['.', '-'], '_', $tld) . '_domain_' . $action, 0, 64);
+        return ['productKey' => $key, 'productName' => '.' . $tld . ' domain ' . $action];
     }
 
     private static function cycleRow(string $relType, int $relId, string $cycle, float $amount, string $currency, string $nextDue): array

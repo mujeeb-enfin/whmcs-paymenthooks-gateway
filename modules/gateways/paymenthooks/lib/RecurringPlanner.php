@@ -20,6 +20,8 @@
  *   periodStart the item's WHMCS next due date (Y-m-d) before this invoice is
  *               paid, i.e. the first day of the period this invoice pays
  *   lineDueDate tblinvoiceitems.duedate of the line (Y-m-d), '' if unknown
+ *   productKey  the catalog item every client shares (InvoicePlan::catalogKey),
+ *   productName e.g. com_domain_renewal / ".com domain renewal"; never client data
  *
  * Rules (README "Recurring billing"):
  *  1. Every eligible recurring item on the invoice is subscribed in ONE
@@ -126,7 +128,8 @@ class RecurringPlanner
                 [$interval, $count, $startsAt] = $eligible[$i];
                 $renewal = (int) $row['recurring']['renewalMinor'];
                 $recurring = ['interval' => $interval, 'intervalCount' => $count] + ($startsAt !== null ? ['startsAt' => $startsAt] : []);
-                $plan['lineItems'][] = ['description' => $description, 'quantity' => 1, 'unitPrice' => $renewal, 'recurring' => $recurring];
+                $plan['lineItems'][] = ['description' => $description, 'quantity' => 1, 'unitPrice' => $renewal, 'recurring' => $recurring]
+                    + self::catalogIdentity($row);
                 if ($startsAt === null) {
                     // Charged now as the subscription's first charge (this period).
                     $sum += $renewal;
@@ -325,6 +328,25 @@ class RecurringPlanner
         $plan['nowMinor'] = 0;
         $plan['oneTime'] = self::oneTimeList($rows, $notes, []);
         return $plan;
+    }
+
+    /**
+     * The PaymentHooks catalog product a recurring line renews under: a key
+     * shared by every client buying the same thing (never the client's domain,
+     * service or dates, which stay in the line description). Rows carry
+     * productKey / productName from InvoicePlan; a row without them sends none
+     * and PaymentHooks files it under its generic product for the cycle.
+     *
+     * @return array{productKey?: string, productName?: string}
+     */
+    private static function catalogIdentity(array $row): array
+    {
+        $key = strtolower(trim((string) ($row['productKey'] ?? '')));
+        if (!preg_match('/^[a-z0-9][a-z0-9_.-]{0,63}$/', $key)) {
+            return [];
+        }
+        $name = self::clip((string) ($row['productName'] ?? ''));
+        return ['productKey' => $key] + ($name !== '' ? ['productName' => $name] : []);
     }
 
     private static function clip(string $description): string

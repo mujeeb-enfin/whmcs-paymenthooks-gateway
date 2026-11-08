@@ -41,6 +41,22 @@ same('weekly', '2026-11-14', RecurringPlanner::addCycle('2026-11-07', 'week', 1)
 same('display date', '7 Nov 2027', RecurringPlanner::formatDate('2027-11-07'));
 throws('not a date refused', function () { RecurringPlanner::addCycle('0000-00-00', 'year', 1); }, \InvalidArgumentException::class);
 
+echo "Catalog identity (one product for every client, never the client's domain)\n";
+same('.com registration', ['productKey' => 'com_domain_registration', 'productName' => '.com domain registration'],
+    InvoicePlan::domainCatalog('DomainRegister', 'taptipm.com'));
+same('.com renewal', ['productKey' => 'com_domain_renewal', 'productName' => '.com domain renewal'],
+    InvoicePlan::domainCatalog('Domain', 'orivanuts.com'));
+same('.co.uk transfer', ['productKey' => 'co_uk_domain_transfer', 'productName' => '.co.uk domain transfer'],
+    InvoicePlan::domainCatalog('DomainTransfer', 'shop.co.uk'));
+same('no domain: no key (PaymentHooks files it under its generic product)', [], InvoicePlan::domainCatalog('Domain', ''));
+$keyed = RecurringPlanner::plan([$domain + ['productKey' => 'com_domain_registration', 'productName' => '.com domain registration']], 80000, $ctx);
+same('recurring line carries the catalog key, the text stays the client\'s',
+    ['description' => 'Domain Registration - example.com - 1 Year/s', 'productKey' => 'com_domain_registration', 'productName' => '.com domain registration'],
+    ['description' => $keyed['lineItems'][0]['description'], 'productKey' => $keyed['lineItems'][0]['productKey'], 'productName' => $keyed['lineItems'][0]['productName']]);
+$bad = RecurringPlanner::plan([$domain + ['productKey' => 'example.com renewal!']], 80000, $ctx);
+same('an invalid key is not sent', false, isset($bad['lineItems'][0]['productKey']));
+same('one-time lines carry no catalog key', false, isset(RecurringPlanner::plan([$hosting, $setup], 115000, $ctx)['lineItems'][1]['productKey']));
+
 echo "Discounted first-year domain (live case: taptipm.com, 1,144.28 + 18% GST)\n";
 // WHMCS line 1,144.28 incl. DNS Management + Email Forwarding, renewal 1,299.00, GST 205.97 => total 1,350.25.
 $live = ['type' => 'DomainRegister', 'relType' => 'domain', 'relId' => 31, 'taxed' => true,

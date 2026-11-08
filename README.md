@@ -83,6 +83,24 @@ are kept. Tables are upgraded automatically on the next request:
 | `mod_paymenthooks_price_map` | Earlier versions' product/price cache; no longer written | `currency`, `amount_minor` |
 | `mod_paymenthooks_install` | A random id for this install, used in idempotency keys | new table |
 
+### One catalog product per item, not per client (3.1.2 to 3.1.3)
+
+Replace all files; there is no table change. 3.1.2 and earlier let PaymentHooks name a product after
+each client's invoice line ("Domain Renewal - example.com - 1 Year/s ..."), so every client added a
+product. 3.1.3 sends each recurring line a catalog key shared by every client buying the same thing:
+
+| Line | productKey | Product name |
+|------|------------|--------------|
+| Hosting | `hosting_<product id>` | the WHMCS product name |
+| Addon | `addon_<addon id>` | the WHMCS addon name |
+| Domain registration / renewal / transfer | `<tld>_domain_registration`, `_renewal`, `_transfer` (e.g. `com_domain_renewal`, `co_uk_domain_transfer`) | `.com domain renewal` |
+
+PaymentHooks keeps one product per key and one price per key + currency + amount + cycle, reused for
+every client (the price is named after them, e.g. `com_domain_registration_usd_15`). The client's
+own line text (domain, period, extras) stays on the checkout, receipt and renewal invoices. Products
+created by earlier versions are merged into these on the PaymentHooks side; subscriptions keep
+renewing unchanged.
+
 ### Phone numbers checked worldwide (3.1.1 to 3.1.2)
 
 Replace all files; there is no table change. PaymentHooks (from 2026-11-08) validates a customer's phone
