@@ -202,7 +202,7 @@ Activity Log.
 
 ## Custom checkout domain
 
-If you verified a custom domain in PaymentHooks (**Settings > Custom Domain**, status Active), put it in
+If you verified a custom domain in PaymentHooks (**Settings > Branding & domains**, status Active), put it in
 **Custom Checkout Domain**, for example `payments.example.com`. Then:
 
 - Clients are redirected to `https://payments.example.com/checkout/...`; the page, the payment and the
